@@ -9,7 +9,7 @@ use std::sync::Arc;
 pub mod client_server;
 /// An implementation of a full mesh topology
 pub mod full_mesh;
-// An implementation of a hybrid topology
+/// An implementation of a hybrid super peer topology
 pub mod hybrid;
 
 #[derive(Clone)]

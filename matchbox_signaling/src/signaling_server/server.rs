@@ -38,7 +38,7 @@ impl SignalingServer {
         SignalingServerBuilder::new(socket_addr, ClientServer, ClientServerState::default())
     }
 
-    // Creates a new builder for a [`SignalingServer`] with hybrid topology
+    /// Creates a new builder for a [`SignalingServer`] with hybrid topology.
     pub fn hybrid_builder(
         socket_addr: impl Into<SocketAddr>,
     ) -> SignalingServerBuilder<Hybrid, HybridCallbacks, HybridState> {
