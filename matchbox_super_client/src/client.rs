@@ -1,4 +1,5 @@
 use log::info;
+use matchbox_socket::Packet;
 use matchbox_socket::{PeerId, WebRtcSocket};
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -64,8 +65,9 @@ enum Message {
 #[wasm_bindgen]
 pub struct Client {
     peer_id: Option<PeerId>,
+    socket: Option<WebRtcSocket>,
     is_super: bool,
-    super_peer: Option<PeerId>, // Each client has a designated super-peer
+    super_peer_id: Option<PeerId>, // Each client has a designated super-peer
     connected_peers: Rc<RefCell<Vec<PeerId>>>,
     peer_positions: Rc<RefCell<HashMap<PeerId, (u32, u32)>>>,
     known_super_peers: Rc<RefCell<Vec<PeerId>>>, // Super-peers track other super-peers
@@ -77,33 +79,33 @@ impl Client {
     pub fn new(is_super: bool) -> Client {
         Client {
             peer_id: None,
+            socket: None,
             is_super,
-            super_peer: None,
+            super_peer_id: None,
             peer_positions: Rc::new(RefCell::new(HashMap::new())),
             connected_peers: Rc::new(RefCell::new(Vec::new())),
             known_super_peers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    /// Super-peer sends the peer list to other super-peers
-    // fn send_peer_list(&self, socket: &mut WebRtcSocket) {
-    //     if self.is_super {
-    //         let peer_list: Vec<String> = self
-    //             .known_super_peers
-    //             .borrow()
-    //             .iter()
-    //             .map(|peer| peer.to_string())
-    //             .collect();
-    //         let msg = Message::PeerList(peer_list);
-    //         let packet = serde_json::to_vec(&msg).unwrap();
+    fn broadcast_message(&self, message: Packet){
 
-    //         // Will need to fix this code to handle sending
-    //         for peer in self.connected_peers.borrow().iter() {
-    //             socket.channel_mut(0).send(packet.clone().into_boxed_slice(), *peer);
-    //         }
-    //         info!("Super-peer sent peer list.");
-    //     }
-    // }
+    }
+
+    fn send_message(&self, message: Packet, peer_id: Option<&PeerId>){
+        if self.is_super{
+            self.broadcast_message(message);
+        }
+        else {
+            if let Some(socket) = &self.socket{
+                if let Some(peer) = peer_id.or(self.super_peer_id.as_ref()) {
+                    // Send to the specified peer or the super peer if none specified
+                    socket.channel_mut(0).send(message.clone(), *peer);
+                }
+            }
+        }
+    }
+
 
     fn send_peer_list<T: SocketSender>(&self, socket: &T) {
         if self.is_super {
@@ -144,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_send_peer_list() {
-        let mut client = Client::new(true); // Super-peer
+        let client = Client::new(true); // Super-peer
         let mock_socket = MockWebRtcSocket::new();
 
         // Add known super-peers and connected peers
