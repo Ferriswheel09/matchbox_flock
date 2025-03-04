@@ -1,10 +1,12 @@
 use log::info;
+use matchbox_socket::Packet;
 use matchbox_socket::{PeerId, WebRtcSocket};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::os::windows::io::OwnedSocket;
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
@@ -22,9 +24,9 @@ impl MockWebRtcSocket {
     }
 
     /// Mocks the behavior of sending a message to a peer.
-    fn send(&self, peer: PeerId, data: Vec<u8>) {
-        self.sent_messages.borrow_mut().push_back((peer, data));
-    }
+    fn send<T: Into<Packet>>(&self, peer: PeerId, data: T) {
+        self.sent_messages.borrow_mut().push_back((peer, data.into().to_vec()));
+    }       
 
     /// Retrieves the last sent message (for testing).
     fn get_last_message(&self) -> Option<(PeerId, Vec<u8>)> {
@@ -65,6 +67,7 @@ enum Message {
 pub struct Client {
     peer_id: Option<PeerId>,
     is_super: bool,
+    socket: Option<WebRtcSocket>,
     super_peer: Option<PeerId>, // Each client has a designated super-peer
     connected_peers: Rc<RefCell<Vec<PeerId>>>,
     peer_positions: Rc<RefCell<HashMap<PeerId, (u32, u32)>>>,
@@ -78,6 +81,7 @@ impl Client {
         Client {
             peer_id: None,
             is_super,
+            socket: None,
             super_peer: None,
             peer_positions: Rc::new(RefCell::new(HashMap::new())),
             connected_peers: Rc::new(RefCell::new(Vec::new())),
@@ -85,26 +89,41 @@ impl Client {
         }
     }
 
-    /// Super-peer sends the peer list to other super-peers
-    // fn send_peer_list(&self, socket: &mut WebRtcSocket) {
-    //     if self.is_super {
-    //         let peer_list: Vec<String> = self
-    //             .known_super_peers
-    //             .borrow()
-    //             .iter()
-    //             .map(|peer| peer.to_string())
-    //             .collect();
-    //         let msg = Message::PeerList(peer_list);
-    //         let packet = serde_json::to_vec(&msg).unwrap();
+    // Broadcast method that, if the client is a super peer
+    // Will send all messages to all super peers in the network
+    // Who will then transmit all messages to all clients
+    // TODO: Will need an abstraction before passing messages to all peers
+    fn broadcast_message<T: SocketSender>(&mut self, socket: &T, packet: Packet) {
+        if self.is_super {
+            // Need to fix this relating to the channels
+            for peer in self.known_super_peers.borrow().iter() {
+                // socket.channel_mut(0).send(packet.clone(), *peer);
+                socket.send(*peer, packet.to_vec().clone());
+            }
+            info!("Forwarded position update to super-peers.");
+        }
+    }
 
-    //         // Will need to fix this code to handle sending
-    //         for peer in self.connected_peers.borrow().iter() {
-    //             socket.channel_mut(0).send(packet.clone().into_boxed_slice(), *peer);
-    //         }
-    //         info!("Super-peer sent peer list.");
-    //     }
-    // }
+    // Sending method that the client can use to either
+    // a. send to their correspondent super peer or
+    // b. broadcast to the network if they are a regular peer
+    fn send<T: SocketSender>(&mut self, socket: &T, packet: Packet) {
+        if self.is_super {
+            self.broadcast_message(socket, packet);
+        } else {
+            if let Some(socket) = &mut self.socket {
+                if let Some(super_peer) = &self.super_peer {
+                    socket
+                        .channel_mut(0)
+                        .send(packet.clone(), super_peer.clone());
+                }
+            }
+        }
+    }
 
+    // Method that will send all peer information to another super peer
+    // This will be useful if a new super peer joins the network
+    // TODO: Change this to only send super peer information. Other super peers don't care about other regular peers
     fn send_peer_list<T: SocketSender>(&self, socket: &T) {
         if self.is_super {
             let peer_list: Vec<String> = self
@@ -122,20 +141,6 @@ impl Client {
             info!("Super-peer sent peer list.");
         }
     }
-
-    /// Super-peer forwards position updates to other super-peers
-    fn forward_to_super_peers(&self, socket: &mut WebRtcSocket, position: &PeerPosition) {
-        let msg = Message::Forward(position.clone());
-        let packet = serde_json::to_vec(&msg).unwrap();
-
-        // Need to fix this relating to the channels
-        for peer in self.known_super_peers.borrow().iter() {
-            socket
-                .channel_mut(0)
-                .send(packet.clone().into_boxed_slice(), *peer);
-        }
-        info!("Forwarded position update to super-peers.");
-    }
 }
 
 #[cfg(test)]
@@ -144,7 +149,8 @@ mod tests {
 
     #[test]
     fn test_send_peer_list() {
-        let mut client = Client::new(true); // Super-peer
+        println!("Running Send Peer List");
+        let client = Client::new(true); // Super-peer
         let mock_socket = MockWebRtcSocket::new();
 
         // Add known super-peers and connected peers
@@ -187,5 +193,45 @@ mod tests {
 
         // Ensure the message was sent to the correct peer
         assert_eq!(peer, connected_peer);
+    }
+
+    #[test]
+    fn test_broadcast_message() {
+        // Create a super peer client
+        println!("Running Test Broadcast Message");
+
+        let mut client = Client::new(true);
+
+        // Create a mock socket that we can inspect
+        let mock_socket = MockWebRtcSocket::new();
+        // Add known super-peers
+        let peer1 = PeerId(Uuid::new_v4());
+        let peer2 = PeerId(Uuid::new_v4());
+
+        client.known_super_peers.borrow_mut().push(peer1);
+        client.known_super_peers.borrow_mut().push(peer2);
+
+        // Create a test packet
+        let test_data = vec![1, 2, 3, 4].into_boxed_slice();
+        let packet: Packet = test_data;
+        println!("Client is super-peer: {}", client.is_super);
+        println!("Known super peers: {:?}", client.known_super_peers.borrow());
+
+        // Broadcast Message
+        client.broadcast_message(&mock_socket, packet);
+
+        // Check that messages were sent to all known super-peers
+        let sent_messages = mock_socket.get_all_messages();
+        assert_eq!(sent_messages.len(), 2);
+
+        // Verify recipients match our expected super-peers
+        let recipients: Vec<PeerId> = sent_messages.iter().map(|(peer, _)| *peer).collect();
+        assert!(recipients.contains(&peer1));
+        assert!(recipients.contains(&peer2));
+
+        // Verify the packet content was correctly sent
+        for (_, data) in sent_messages {
+            assert_eq!(data, vec![1, 2, 3, 4]);
+        }
     }
 }
