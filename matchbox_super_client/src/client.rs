@@ -124,8 +124,9 @@ impl Client {
     // Method that will send all peer information to another super peer
     // This will be useful if a new super peer joins the network
     // TODO: Change this to only send super peer information. Other super peers don't care about other regular peers
-    fn send_peer_list<T: SocketSender>(&self, socket: &T) {
+    fn send_super_peer_list<T: SocketSender>(&self, socket: &T) {
         if self.is_super {
+            // Get the known super peers from the client to pass to the new connecting super peer
             let peer_list: Vec<String> = self
                 .known_super_peers
                 .borrow()
@@ -139,6 +140,17 @@ impl Client {
                 socket.send(*peer, packet.clone());
             }
             info!("Super-peer sent peer list.");
+        }
+    }
+
+    // Helper function that is necessary for new super peers entering the network
+    // where given the list of super peers, add them to our local struct
+    // TODO: What will happen if a peer gets promoted? 
+    // Maybe we send the peer list to every other peer for redundancy to limit the overhead
+    fn add_super_peer_list<T: SocketSender>(&mut self, peer_list: Packet) {
+        // Check to make sure that the peer is super (shouldn't add to list otherwise)
+        if self.is_super{
+
         }
     }
 }
@@ -167,7 +179,7 @@ mod tests {
         println!("Connected peers: {:?}", client.connected_peers.borrow());
 
         // Call send_peer_list()
-        client.send_peer_list(&mock_socket);
+        client.send_super_peer_list(&mock_socket);
 
         // Retrieve last sent message
         let (peer, data) = mock_socket.get_last_message().expect("No message was sent");
