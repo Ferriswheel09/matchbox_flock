@@ -3,7 +3,7 @@ use matchbox_socket::Packet;
 use matchbox_socket::{PeerId, WebRtcSocket};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
