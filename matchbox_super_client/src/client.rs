@@ -3,7 +3,7 @@ use matchbox_socket::Packet;
 use matchbox_socket::{PeerId, WebRtcSocket};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -51,28 +51,37 @@ impl SocketSender for MockWebRtcSocket {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct PeerPosition {
-    peer_id: String,
-    x: u32,
-    y: u32,
+struct Position {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    x: i32,
+    y: i32,
+    x_velocity: i32, 
+    y_velocity: i32
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Message {
-    PositionUpdate(PeerPosition),
-    Forward(PeerPosition),
+    PositionUpdate(Position),
+    Forward(Position),
     PeerList(Vec<String>),
 }
 
 #[wasm_bindgen]
 pub struct Client {
+    // Identity 
     peer_id: Option<PeerId>,
     is_super: bool,
-    socket: Option<WebRtcSocket>,
-    super_peer: Option<PeerId>, // Each client has a designated super-peer
-    connected_peers: Rc<RefCell<Vec<PeerId>>>,
-    peer_positions: Rc<RefCell<HashMap<PeerId, (u32, u32)>>>,
+
+    // Positioning
+    position: Rc<RefCell<Position>>, 
+    peer_positions: Rc<RefCell<HashMap<PeerId, (i32, i32, i32, i32)>>>,
+   
+    // Networking
     known_super_peers: Rc<RefCell<Vec<PeerId>>>, // Super-peers track other super-peers
+    socket: Option<WebRtcSocket>,
+    super_peer: Option<PeerId>, // Each client has a designated super-peer if they are a regular peer
+    connected_peers: Rc<RefCell<Vec<PeerId>>>,
 }
 
 #[wasm_bindgen]
@@ -84,9 +93,121 @@ impl Client {
             is_super,
             socket: None,
             super_peer: None,
-            peer_positions: Rc::new(RefCell::new(HashMap::new())),
             connected_peers: Rc::new(RefCell::new(Vec::new())),
             known_super_peers: Rc::new(RefCell::new(Vec::new())),
+            peer_positions: Rc::new(RefCell::new(HashMap::new())),
+            position: Rc::new(RefCell::new(Position {
+                peer_id: None,
+                x: 10, 
+                y: 20, 
+                x_velocity: 0, 
+                y_velocity: 0
+            }))
+        }
+    }
+
+    // The below section will be adding all the methods from our original library
+    // Will try to keep it as similar as possible to avoid rewriting API code in frontend
+
+    // update_id: Update the current clients ID
+    pub fn update_id(&mut self, new_id: String) {
+        match uuid::Uuid::parse_str(&new_id) {
+            Ok(uuid) => {
+                self.peer_id = Some(PeerId(uuid));
+            },
+            Err(err) => {
+                eprintln!("Failed to parse UUID: {}", err);
+            }
+        }
+    }
+
+    // update_position: Update the current clients Position
+    pub fn update_position(&mut self, x: i32, y: i32, x_velocity: i32, y_velocity: i32) {
+        let mut position = self.position.borrow_mut();
+        position.x = x;
+        position.y = y;
+        position.x_velocity = x_velocity;
+        position.y_velocity = y_velocity;
+    }
+
+    // get_position_velocity: Return the position and velocity of the current client as a string
+    pub fn get_position_velocity(&self) -> String{
+        match &self.peer_id {
+            Some(id) => format!(
+                "Player {} is at position: X={}, Y={}, X Velocity={}, Y Velocity={}",
+                id, self.position.borrow().x, self.position.borrow().y, self.position.borrow().x_velocity, self.position.borrow().y_velocity
+            ), 
+            _ => "Error getting Position Velocity".to_string(),
+        }
+    }
+
+    // Below are helper methods for the getters of the different position values
+    #[wasm_bindgen(getter)]
+    pub fn x(&self) -> i32 {
+        self.position.borrow().x
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn y(&self) -> i32 {
+        self.position.borrow().y
+    }
+    
+    #[wasm_bindgen(getter)]
+    pub fn x_velocity(&self) -> i32 {
+        self.position.borrow().x_velocity
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn y_velocity(&self) -> i32 {
+        self.position.borrow().y_velocity
+    }
+
+    // Need additional helper methods for state (debugging)
+    pub fn is_super_peer(&self) -> bool {
+        self.is_super 
+    }
+
+    // get_all_positions: Returns the list of all peers and all of their positions
+    // Necessary in order to get current state of all players (as well as if any dropped)
+    #[wasm_bindgen]
+    pub fn get_all_positions(&self) -> JsValue {
+        let peer_positions = self.peer_positions.borrow();
+        let positions: Vec<Position> = peer_positions
+            .iter()
+            .map(|(peer_id, &(x, y, x_velocity, y_velocity))| Position {
+                peer_id: Some(peer_id.to_string()),
+                x,
+                y,
+                x_velocity, 
+                y_velocity
+            })
+            .collect();
+    
+        JsValue::from_serde(&positions).unwrap_or(JsValue::from_str("[]"))
+    }
+
+    /// Gets the client's current peer ID as a string.
+    #[wasm_bindgen(getter)]
+    pub fn peer_id_string(&self) -> String {
+        match &self.peer_id {
+            Some(id) => id.0.to_string(),
+            None => "Not set".to_string(),
+        }
+    }
+
+    /// Gets the number of connected peers.
+    #[wasm_bindgen(getter)]
+    pub fn connected_peer_count(&self) -> usize {
+        self.connected_peers.borrow().len()
+    }
+
+    /// Gets the number of known super peers (only relevant for super peers).
+    #[wasm_bindgen(getter)]
+    pub fn known_super_peer_count(&self) -> usize {
+        if self.is_super {
+            self.known_super_peers.borrow().len()
+        } else {
+            0
         }
     }
 
@@ -171,6 +292,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_send_peer_list() {
         println!("Running Send Peer List");
@@ -296,5 +418,194 @@ mod tests {
             send_peers.len() == recv_peers.len()
                 && send_peers.iter().all(|p| recv_peers.contains(p))
         );
+    }
+
+    // Rest of the tests for the basic functionality in the previous demo
+    #[test]
+    #[test]
+    fn test_constructor() {
+        // Test regular peer
+        let client = Client::new(false);
+        assert_eq!(client.is_super_peer(), false);
+        assert_eq!(client.peer_id, None);
+        assert_eq!(client.position.borrow().x, 10);
+        assert_eq!(client.position.borrow().y, 20);
+        assert_eq!(client.position.borrow().x_velocity, 0);
+        assert_eq!(client.position.borrow().y_velocity, 0);
+        assert_eq!(client.connected_peer_count(), 0);
+        assert_eq!(client.known_super_peer_count(), 0);
+        
+        // Test super peer
+        let super_client = Client::new(true);
+        assert_eq!(super_client.is_super_peer(), true);
+        assert_eq!(super_client.peer_id, None);
+    }
+
+    #[test]
+    fn test_update_id() {
+        let mut client = Client::new(false);
+        
+        // Test valid UUID
+        let valid_uuid = Uuid::new_v4().to_string();
+        client.update_id(valid_uuid.clone());
+        assert_eq!(client.peer_id_string(), valid_uuid);
+        
+        // Test invalid UUID
+        client.update_id("not-a-valid-uuid".to_string());
+        // ID should remain unchanged
+        assert_eq!(client.peer_id_string(), valid_uuid);
+    }
+
+    #[test]
+    fn test_update_position() {
+        let mut client = Client::new(false);
+        
+        // Update position and verify
+        client.update_position(100, 200, 5, -3);
+        assert_eq!(client.x(), 100);
+        assert_eq!(client.y(), 200);
+        assert_eq!(client.x_velocity(), 5);
+        assert_eq!(client.y_velocity(), -3);
+        
+        // Update again and check changes
+        client.update_position(150, 250, 0, 0);
+        assert_eq!(client.x(), 150);
+        assert_eq!(client.y(), 250);
+        assert_eq!(client.x_velocity(), 0);
+        assert_eq!(client.y_velocity(), 0);
+    }
+
+    #[test]
+    fn test_position_getters() {
+        let mut client = Client::new(false);
+        client.update_position(123, 456, 7, 8);
+        
+        // Test individual getters
+        assert_eq!(client.x(), 123);
+        assert_eq!(client.y(), 456);
+        assert_eq!(client.x_velocity(), 7);
+        assert_eq!(client.y_velocity(), 8);
+    }
+
+    #[test]
+    fn test_get_position_velocity() {
+        let mut client = Client::new(false);
+        
+        // Initially the peer_id is None, so it should return an error message
+        assert_eq!(client.get_position_velocity(), "Error getting Position Velocity");
+        
+        // Set a peer ID
+        let uuid = Uuid::new_v4().to_string();
+        client.update_id(uuid.clone());
+        
+        // Update position and verify the formatted string
+        client.update_position(42, 99, 3, -1);
+        let expected_format = format!(
+            "Player {} is at position: X=42, Y=99, X Velocity=3, Y Velocity=-1",
+            uuid
+        );
+        assert_eq!(client.get_position_velocity(), expected_format);
+    }
+
+    #[test]
+    fn test_is_super_peer() {
+        let regular_client = Client::new(false);
+        let super_client = Client::new(true);
+        
+        assert_eq!(regular_client.is_super_peer(), false);
+        assert_eq!(super_client.is_super_peer(), true);
+    }
+
+    // TODO: Need a better test for get_all_positions
+    // #[test]
+    // fn test_get_all_positions() {
+    //     let client = Client::new(false);
+        
+    //     // Initially, there should be no positions
+    //     let positions_js = client.get_all_positions();
+    //     let positions: Vec<Position> = serde_json::from_str(&positions_js.as_string().unwrap()).unwrap_or_else(|_| Vec::new());
+    //     assert_eq!(positions.len(), 0);
+        
+    //     // Add some peer positions
+    //     let peer1 = PeerId(Uuid::new_v4());
+    //     let peer2 = PeerId(Uuid::new_v4());
+        
+    //     client.peer_positions.borrow_mut().insert(peer1, (10, 20, 1, 2));
+    //     client.peer_positions.borrow_mut().insert(peer2, (30, 40, 3, 4));
+        
+    //     // Get positions and verify
+    //     let positions_js = client.get_all_positions();
+    //     let positions: Vec<Position> = serde_json::from_str(&positions_js.as_string().unwrap()).unwrap_or_else(|_| Vec::new());
+        
+    //     assert_eq!(positions.len(), 2);
+        
+    //     // Check if both peers are included (order might be different)
+    //     let contains_peer1 = positions.iter().any(|p| {
+    //         p.peer_id.as_ref().map_or(false, |id| id == peer1.0.to_string().as_str()) &&
+    //         p.x == 10 && p.y == 20 && p.x_velocity == 1 && p.y_velocity == 2
+    //     });
+        
+    //     let contains_peer2 = positions.iter().any(|p| {
+    //         p.peer_id.as_ref().map_or(false, |id| id == peer2.0.to_string().as_str()) &&
+    //         p.x == 30 && p.y == 40 && p.x_velocity == 3 && p.y_velocity == 4
+    //     });
+        
+    //     assert!(contains_peer1);
+    //     assert!(contains_peer2);
+    // }
+
+    #[test]
+    fn test_peer_id_string() {
+        let mut client = Client::new(false);
+        
+        // Initially, peer_id is None
+        assert_eq!(client.peer_id_string(), "Not set");
+        
+        // Set a valid peer ID
+        let uuid = Uuid::new_v4().to_string();
+        client.update_id(uuid.clone());
+        assert_eq!(client.peer_id_string(), uuid);
+    }
+
+    #[test]
+    fn test_connected_peer_count() {
+        let client = Client::new(false);
+        
+        // Initially, there are no connected peers
+        assert_eq!(client.connected_peer_count(), 0);
+        
+        // Add some connected peers
+        let peer1 = PeerId(Uuid::new_v4());
+        let peer2 = PeerId(Uuid::new_v4());
+        let peer3 = PeerId(Uuid::new_v4());
+        
+        client.connected_peers.borrow_mut().push(peer1);
+        assert_eq!(client.connected_peer_count(), 1);
+        
+        client.connected_peers.borrow_mut().push(peer2);
+        client.connected_peers.borrow_mut().push(peer3);
+        assert_eq!(client.connected_peer_count(), 3);
+    }
+
+    #[test]
+    fn test_known_super_peer_count() {
+        // For regular peer, it should always return 0
+        let regular_client = Client::new(false);
+        let peer1 = PeerId(Uuid::new_v4());
+        regular_client.known_super_peers.borrow_mut().push(peer1);
+        assert_eq!(regular_client.known_super_peer_count(), 0);
+        
+        // For super peer, it should reflect the actual count
+        let super_client = Client::new(true);
+        assert_eq!(super_client.known_super_peer_count(), 0);
+        
+        let peer2 = PeerId(Uuid::new_v4());
+        let peer3 = PeerId(Uuid::new_v4());
+        
+        super_client.known_super_peers.borrow_mut().push(peer2);
+        assert_eq!(super_client.known_super_peer_count(), 1);
+        
+        super_client.known_super_peers.borrow_mut().push(peer3);
+        assert_eq!(super_client.known_super_peer_count(), 2);
     }
 }
