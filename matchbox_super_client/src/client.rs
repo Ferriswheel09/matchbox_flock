@@ -6,14 +6,13 @@ use serde_json;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::os::windows::io::OwnedSocket;
 use std::rc::Rc;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
 /// Mock WebRtcSocket that captures sent messages instead of sending them.
 struct MockWebRtcSocket {
-    sent_messages: Rc<RefCell<VecDeque<(PeerId, Vec<u8>)>>>,
+    sent_messages: Rc<RefCell<VecDeque<(PeerId, Packet)>>>,
 }
 
 impl MockWebRtcSocket {
@@ -25,26 +24,28 @@ impl MockWebRtcSocket {
 
     /// Mocks the behavior of sending a message to a peer.
     fn send<T: Into<Packet>>(&self, peer: PeerId, data: T) {
-        self.sent_messages.borrow_mut().push_back((peer, data.into().to_vec()));
-    }       
+        self.sent_messages
+            .borrow_mut()
+            .push_back((peer, data.into()));
+    }
 
     /// Retrieves the last sent message (for testing).
-    fn get_last_message(&self) -> Option<(PeerId, Vec<u8>)> {
+    fn get_last_message(&self) -> Option<(PeerId, Packet)> {
         self.sent_messages.borrow_mut().pop_back()
     }
 
     /// Retrieves all sent messages.
-    fn get_all_messages(&self) -> Vec<(PeerId, Vec<u8>)> {
+    fn get_all_messages(&self) -> Vec<(PeerId, Packet)> {
         self.sent_messages.borrow().clone().into()
     }
 }
 
 pub trait SocketSender {
-    fn send(&self, peer: PeerId, data: Vec<u8>);
+    fn send(&self, peer: PeerId, data: Packet);
 }
 
 impl SocketSender for MockWebRtcSocket {
-    fn send(&self, peer: PeerId, data: Vec<u8>) {
+    fn send(&self, peer: PeerId, data: Packet) {
         self.send(peer, data);
     }
 }
@@ -98,7 +99,7 @@ impl Client {
             // Need to fix this relating to the channels
             for peer in self.known_super_peers.borrow().iter() {
                 // socket.channel_mut(0).send(packet.clone(), *peer);
-                socket.send(*peer, packet.to_vec().clone());
+                socket.send(*peer, packet.clone());
             }
             info!("Forwarded position update to super-peers.");
         }
@@ -134,7 +135,7 @@ impl Client {
                 .map(|peer| peer.0.to_string()) // Extract Uuid from PeerId
                 .collect();
             let msg = Message::PeerList(peer_list);
-            let packet = serde_json::to_vec(&msg).unwrap();
+            let packet = serde_json::to_vec(&msg).unwrap().into_boxed_slice();
 
             for peer in self.connected_peers.borrow().iter() {
                 socket.send(*peer, packet.clone());
@@ -145,12 +146,24 @@ impl Client {
 
     // Helper function that is necessary for new super peers entering the network
     // where given the list of super peers, add them to our local struct
-    // TODO: What will happen if a peer gets promoted? 
+    // TODO: What will happen if a peer gets promoted?
     // Maybe we send the peer list to every other peer for redundancy to limit the overhead
-    fn add_super_peer_list<T: SocketSender>(&mut self, peer_list: Packet) {
+    fn add_super_peer_list(&mut self, peer_list: Packet) {
         // Check to make sure that the peer is super (shouldn't add to list otherwise)
-        if self.is_super{
-
+        if self.is_super {
+            let message: Message =
+                serde_json::from_slice(&peer_list).expect("Couldn't convert message to peer list");
+            match message {
+                Message::PeerList(peers) => {
+                    let mut peer_ref = self.known_super_peers.borrow_mut();
+                    for peer in peers {
+                        peer_ref.push(PeerId(
+                            Uuid::parse_str(&peer).expect("Couldn't conver to UUID"),
+                        ));
+                    }
+                }
+                _ => panic!("Expected peer list "),
+            }
         }
     }
 }
@@ -158,7 +171,6 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn test_send_peer_list() {
         println!("Running Send Peer List");
@@ -243,7 +255,46 @@ mod tests {
 
         // Verify the packet content was correctly sent
         for (_, data) in sent_messages {
-            assert_eq!(data, vec![1, 2, 3, 4]);
+            assert_eq!(data, [1, 2, 3, 4].into());
         }
+    }
+
+    #[test]
+    fn test_add_super_peers() {
+        println!("Running Adding Super Peer to Local List...");
+
+        let send_client = Client::new(true);
+        let mut recv_client = Client::new(true);
+
+        // Create a mock socket that we will inspect for message
+        let mock_socket = MockWebRtcSocket::new();
+
+        // Add known super-peers to the "sending" client
+        let peer1 = PeerId(Uuid::new_v4());
+        let peer2 = PeerId(Uuid::new_v4());
+        let connected_peer = PeerId(Uuid::new_v4());
+        send_client.known_super_peers.borrow_mut().push(peer1);
+        send_client.known_super_peers.borrow_mut().push(peer2);
+        send_client.connected_peers.borrow_mut().push(connected_peer);
+
+        // Create a test packet that will have (hypothetically) been sent to our client
+        send_client.send_super_peer_list(&mock_socket);
+
+        // Retrieve last sent message
+        let (peer, data) = mock_socket.get_last_message().expect("No message was sent");
+
+        // Print last message (for debugging purposes)
+        println!("Sent raw data to {}: {:?}", peer, data);
+
+        // After sending client hypothetically sent the packet, ensure receiving client adds the clients to their list
+        recv_client.add_super_peer_list(data);
+
+        // Assert that both clients have the same super-peer list contents
+        let send_peers = send_client.known_super_peers.borrow().clone();
+        let recv_peers = recv_client.known_super_peers.borrow().clone();
+        assert!(
+            send_peers.len() == recv_peers.len()
+                && send_peers.iter().all(|p| recv_peers.contains(p))
+        );
     }
 }
