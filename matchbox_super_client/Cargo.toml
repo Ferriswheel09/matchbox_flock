@@ -20,8 +20,11 @@ console_log = "1.0"
 version = "1.15.1"
 # Lets you generate random UUIDs
 features = [
-    "v4",
+    "v4", "js"
 ]
 
 [dev-dependencies]
 wasm-bindgen-test = "0.2"
+
+[lib]
+crate-type = ["cdylib"]
