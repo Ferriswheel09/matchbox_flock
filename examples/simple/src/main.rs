@@ -33,17 +33,17 @@ async fn main() {
 
 async fn async_main() {
     info!("Connecting to matchbox");
-    let turn_server = matchbox_socket::RtcIceServerConfig {
-        urls: vec![
-            "stun:54.237.246.108:3478".to_string(), 
-            "turn:54.237.246.108:3478".to_string()
-        ],
-        username: Some("youruser".to_string()),
-        credential: Some("yourpassword".to_string()),
-    };
+    // let turn_server = matchbox_socket::RtcIceServerConfig {
+    //     urls: vec![
+    //         "stun:54.237.246.108:3478".to_string(), 
+    //         "turn:54.237.246.108:3478".to_string()
+    //     ],
+    //     username: Some("youruser".to_string()),
+    //     credential: Some("yourpassword".to_string()),
+    // };
     
-    let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://54.87.34.183:3536/")
-        .ice_server(turn_server)
+    let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://localhost:3536/")
+        //.ice_server(turn_server)
         .add_reliable_channel()
         .build();
     
