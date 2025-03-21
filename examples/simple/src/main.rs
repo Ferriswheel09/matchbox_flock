@@ -1,7 +1,7 @@
 use futures::{select, FutureExt};
 use futures_timer::Delay;
 use log::info;
-use matchbox_socket::{PeerState, WebRtcSocket};
+use matchbox_socket::{PeerState, WebRtcSocket, WebRtcSocketBuilder};
 use std::time::Duration;
 
 const CHANNEL_ID: usize = 0;
@@ -33,8 +33,20 @@ async fn main() {
 
 async fn async_main() {
     info!("Connecting to matchbox");
-    let (mut socket, loop_fut) = WebRtcSocket::new_reliable("ws://localhost:3536/");
-
+    // let turn_server = matchbox_socket::RtcIceServerConfig {
+    //     urls: vec![
+    //         "stun:54.237.246.108:3478".to_string(), 
+    //         "turn:54.237.246.108:3478".to_string()
+    //     ],
+    //     username: Some("youruser".to_string()),
+    //     credential: Some("yourpassword".to_string()),
+    // };
+    
+    let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://localhost:3536/")
+        //.ice_server(turn_server)
+        .add_reliable_channel()
+        .build();
+    
     let loop_fut = loop_fut.fuse();
     futures::pin_mut!(loop_fut);
 
