@@ -15,54 +15,54 @@ use axum::extract::ws::Message;
 use futures::StreamExt;
 use matchbox_protocol::{JsonPeerEvent, PeerId, PeerRequest};
 use std::collections::HashMap;
-use tracing::{error, info, warn};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-    
+use tracing::{error, info, warn};
+
 /// A client server network topology
 #[derive(Debug, Default)]
 pub struct Hybrid;
 
 impl SignalingServerBuilder<Hybrid, HybridCallbacks, HybridState> {
-/// Set a callback triggered on all super peer websocket connections.
-pub fn on_super_peer_connected<F>(mut self, callback: F) -> Self
-where
-    F: Fn(PeerId) + Send + Sync + 'static,
-{
-    self.callbacks.on_super_peer_connected = Callback::from(callback);
-    self
-}
+    /// Set a callback triggered on all super peer websocket connections.
+    pub fn on_super_peer_connected<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(PeerId) + Send + Sync + 'static,
+    {
+        self.callbacks.on_super_peer_connected = Callback::from(callback);
+        self
+    }
 
-/// Set a callback triggered on all super peer websocket disconnections.
-pub fn on_super_peer_disconnected<F>(mut self, callback: F) -> Self
-where
-    F: Fn(PeerId) + Send + Sync + 'static,
-{
-    self.callbacks.on_super_peer_disconnected = Callback::from(callback);
-    self
-}
+    /// Set a callback triggered on all super peer websocket disconnections.
+    pub fn on_super_peer_disconnected<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(PeerId) + Send + Sync + 'static,
+    {
+        self.callbacks.on_super_peer_disconnected = Callback::from(callback);
+        self
+    }
 
-/// Set a callback triggered on peer websocket connection.
-pub fn on_peer_connected<F>(mut self, callback: F) -> Self
-where
-    F: Fn(PeerId) + Send + Sync + 'static,
-{
-    self.callbacks.on_peer_connected = Callback::from(callback);
-    self
-}
+    /// Set a callback triggered on peer websocket connection.
+    pub fn on_peer_connected<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(PeerId) + Send + Sync + 'static,
+    {
+        self.callbacks.on_peer_connected = Callback::from(callback);
+        self
+    }
 
-/// Set a callback triggered on peer websocket disconnection.
-pub fn on_peer_disconnected<F>(mut self, callback: F) -> Self
-where
-    F: Fn(PeerId) + Send + Sync + 'static,
-{
-    self.callbacks.on_peer_disconnected = Callback::from(callback);
-    self
-}
+    /// Set a callback triggered on peer websocket disconnection.
+    pub fn on_peer_disconnected<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(PeerId) + Send + Sync + 'static,
+    {
+        self.callbacks.on_peer_disconnected = Callback::from(callback);
+        self
+    }
 }
 
 #[async_trait]
-impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
+impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid {
     async fn state_machine(upgrade: WsStateMeta<HybridCallbacks, HybridState>) {
         let WsStateMeta {
             peer_id,
@@ -75,6 +75,16 @@ impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
         // Implement state machine logic for hybrid architechture
         if state.get_num_super_peers() < 2 {
             state.add_super_peer(peer_id, sender.clone());
+
+            // Need to let the super peer know that it ACTUALLY is a super peer so that it can keep it in its state
+            let event_text = JsonPeerEvent::SuperIdAssigned(peer_id).to_string();
+            let event = Message::Text(event_text.clone());
+            if let Err(e) = try_send(&sender, event) {
+                error!("error sending to {peer_id}: {e:?}");
+            } else {
+                info!("{peer_id} -> {event_text}");
+            };
+
             callbacks.on_super_peer_connected.emit(peer_id);
         } else {
             state.add_child_peer(peer_id, sender.clone());
@@ -82,6 +92,16 @@ impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
                 match state.connect_child(peer_id, parent) {
                     Ok(_) => {
                         info!("Connected {peer_id} to {parent}");
+
+                        // Additionally, if we connect a child peer to a parent peer, need to notify them of that
+                        let event_text = JsonPeerEvent::ParentAssigned(parent).to_string();
+                        let event = Message::Text(event_text.clone());
+                        if let Err(e) = try_send(&sender, event) {
+                            error!("error sending to {peer_id}: {e:?}");
+                        } else {
+                            info!("{peer_id} -> {event_text}");
+                        };
+
                         callbacks.on_peer_connected.emit(peer_id);
                     }
                     Err(e) => {
@@ -89,16 +109,15 @@ impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
                         return;
                     }
                 }
-            }
-            else {
+            } else {
                 error!("error finding super peer");
             }
         }
 
         let super_peer = state.is_super_peer(&peer_id);
 
-         // The state machine for the data channel established for this websocket.
-         while let Some(request) = receiver.next().await {
+        // The state machine for the data channel established for this websocket.
+        while let Some(request) = receiver.next().await {
             let request = match parse_request(request) {
                 Ok(request) => request,
                 Err(e) => {
@@ -130,9 +149,10 @@ impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
             match request {
                 PeerRequest::Signal { receiver, data } => {
                     let event = Message::Text(
-                        JsonPeerEvent::Signal {
+                        JsonPeerEvent::SuperPeerSignal {
                             sender: peer_id,
                             data,
+                            super_peer,
                         }
                         .to_string(),
                     );
@@ -161,7 +181,6 @@ impl SignalingTopology<HybridCallbacks, HybridState> for Hybrid{
             // Lifecycle event: On ChildPeer Disonnected
             callbacks.on_peer_disconnected.emit(peer_id);
         }
-        
     }
 }
 
@@ -195,21 +214,21 @@ impl ChildPeer {
     pub fn new(id: PeerId, signaling_channel: SignalingChannel) -> Self {
         ChildPeer {
             id,
-            parent_id : None,
+            parent_id: None,
             signaling_channel,
-        }   
+        }
     }
 }
 
 /// Super peer
 #[derive(Debug, Clone)]
 pub struct SuperPeer {
-        /// Peer id
-        pub id: PeerId,
-        /// Set of children peers
-        pub children: StateObj<HashSet<PeerId>>,                          
-        /// Channel to communicate with signaling server
-        pub signaling_channel: SignalingChannel,
+    /// Peer id
+    pub id: PeerId,
+    /// Set of children peers
+    pub children: StateObj<HashSet<PeerId>>,
+    /// Channel to communicate with signaling server
+    pub signaling_channel: SignalingChannel,
 }
 
 impl SuperPeer {
@@ -219,7 +238,7 @@ impl SuperPeer {
             id,
             children: Arc::new(Mutex::new(HashSet::new())),
             signaling_channel,
-        }  
+        }
     }
 }
 
@@ -229,7 +248,7 @@ pub struct HybridState {
     pub(crate) super_peers: StateObj<HashMap<PeerId, SuperPeer>>,
     pub(crate) child_peers: StateObj<HashMap<PeerId, ChildPeer>>,
 }
-impl SignalingState for HybridState {}  
+impl SignalingState for HybridState {}
 
 impl HybridState {
     // TODO: implement functions to be called in state machine logic
@@ -241,18 +260,17 @@ impl HybridState {
 
     /// Check if peer_id is associated with a super peer
     pub fn is_super_peer(&self, peer: &PeerId) -> bool {
-        self.super_peers.lock()
-                        .unwrap()
-                        .contains_key(peer)
+        self.super_peers.lock().unwrap().contains_key(peer)
     }
 
     /// Find optimal super peer to give child
     pub fn find_super_peer(&mut self) -> Option<PeerId> {
-        self.super_peers.lock()
-                        .unwrap()
-                        .iter()
-                        .min_by_key(|(&id, sp)| (sp.children.lock().unwrap().len(), id))
-                        .map(|(&id, _)| id)
+        self.super_peers
+            .lock()
+            .unwrap()
+            .iter()
+            .min_by_key(|(&id, sp)| (sp.children.lock().unwrap().len(), id))
+            .map(|(&id, _)| id)
     }
 
     /// Add a new super peer
@@ -267,35 +285,40 @@ impl HybridState {
             }
         });
         // Safety: All prior locks in this method must be freed prior to this call
-        self.super_peers.lock().as_mut().unwrap().insert(peer, SuperPeer::new(peer, sender));
+        self.super_peers
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(peer, SuperPeer::new(peer, sender));
     }
 
     /// Add child peer
     pub fn add_child_peer(&mut self, peer: PeerId, sender: SignalingChannel) {
-        self.child_peers.lock()
-                        .as_mut()
-                        .unwrap()
-                        .insert(peer, ChildPeer::new(peer, sender));
+        self.child_peers
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(peer, ChildPeer::new(peer, sender));
     }
 
     /// Connect child to super peer
-    pub fn connect_child(&mut self, child_peer: PeerId, super_peer: PeerId) -> Result<(), SignalingError> {
+    pub fn connect_child(
+        &mut self,
+        child_peer: PeerId,
+        super_peer: PeerId,
+    ) -> Result<(), SignalingError> {
         if let Some(sp) = self.super_peers.lock().unwrap().get(&super_peer) {
-            
-            sp.children.lock()
-                        .as_mut()
-                        .unwrap()
-                        .insert(child_peer);   
+            sp.children.lock().as_mut().unwrap().insert(child_peer);
         }
 
         if let Some(cp) = self.child_peers.lock().unwrap().get_mut(&child_peer) {
             cp.parent_id = Some(super_peer);
-        } 
-        
+        }
+
         let event = Message::Text(JsonPeerEvent::NewPeer(child_peer).to_string());
-        
-        self.try_send_to_super_peer(super_peer, event)    
-    }   
+
+        self.try_send_to_super_peer(super_peer, event)
+    }
 
     /// Remove child peer
     pub fn remove_child_peer(&mut self, peer: &PeerId) {
@@ -325,45 +348,49 @@ impl HybridState {
             let event = Message::Text(JsonPeerEvent::PeerLeft(super_peer.id).to_string());
             // Safety: Lock must be scoped/dropped to ensure no deadlock with loop
             let super_peers = { self.super_peers.lock().unwrap().clone() };
-            super_peers.keys().for_each(
-            |peer_id| match self.try_send_to_super_peer(*peer_id, event.clone()) {
-                Ok(()) => info!("Sent peer remove to: {peer_id}"),                                      
-                Err(e) => error!("Failure sending peer remove: {e:?}"),
-                },
-            );
+            super_peers.keys().for_each(|peer_id| {
+                match self.try_send_to_super_peer(*peer_id, event.clone()) {
+                    Ok(()) => info!("Sent peer remove to: {peer_id}"),
+                    Err(e) => error!("Failure sending peer remove: {e:?}"),
+                }
+            });
 
             let children = super_peer.children.lock().unwrap();
 
-            children.iter().for_each(
-                |peer_id| match self.try_send_to_child_peer(*peer_id, event.clone()) {
-                    Ok(()) => info!("Sent peer remove to: {peer_id}"),                                      
+            children.iter().for_each(|peer_id| {
+                match self.try_send_to_child_peer(*peer_id, event.clone()) {
+                    Ok(()) => info!("Sent peer remove to: {peer_id}"),
                     Err(e) => error!("Failure sending peer remove: {e:?}"),
-                },
-            );
+                }
+            });
 
-            if let Some(recruit_id) = children.iter().min(){ 
-
+            if let Some(recruit_id) = children.iter().min() {
                 let recruit = { self.child_peers.lock().as_mut().unwrap().remove(recruit_id) };
 
                 if let Some(recruit) = recruit {
                     self.add_super_peer(*recruit_id, recruit.signaling_channel);
                     info!("added {recruit_id} as super peer");
-                    children.iter().for_each(
-                        |child_id| if child_id != recruit_id { 
+                    children.iter().for_each(|child_id| {
+                        if child_id != recruit_id {
                             match self.connect_child(*child_id, *recruit_id) {
                                 Ok(()) => info!("redistributed {child_id} to {recruit_id}"),
-                                Err(e) => error!("Failure redistributing {child_id} to {recruit_id}: {e:?}")
-                            } 
+                                Err(e) => error!(
+                                    "Failure redistributing {child_id} to {recruit_id}: {e:?}"
+                                ),
+                            }
                         }
-                    )
+                    })
                 }
             }
         }
-        
     }
 
     /// Send signaling message to super peer
-    pub fn try_send_to_super_peer(&self, peer: PeerId, message: Message) -> Result<(), SignalingError> {
+    pub fn try_send_to_super_peer(
+        &self,
+        peer: PeerId,
+        message: Message,
+    ) -> Result<(), SignalingError> {
         self.super_peers
             .lock()
             .as_mut()
@@ -371,17 +398,20 @@ impl HybridState {
             .get(&peer)
             .ok_or_else(|| SignalingError::UnknownPeer)
             .and_then(|sender| try_send(&sender.signaling_channel, message))
-        
     }
 
     /// Send signaling message to child peer
-    pub fn try_send_to_child_peer(&self, peer: PeerId, message: Message) -> Result<(), SignalingError> {
+    pub fn try_send_to_child_peer(
+        &self,
+        peer: PeerId,
+        message: Message,
+    ) -> Result<(), SignalingError> {
         self.child_peers
             .lock()
             .as_mut()
             .unwrap()
             .get(&peer)
             .ok_or_else(|| SignalingError::UnknownPeer)
-            .and_then(|sender| try_send(&sender.signaling_channel, message))      
+            .and_then(|sender| try_send(&sender.signaling_channel, message))
     }
 }

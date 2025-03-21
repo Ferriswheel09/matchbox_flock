@@ -22,11 +22,18 @@ pub enum PeerEvent<S> {
     /// Sent by the server to the connecting peer, immediately after connection
     /// before any other events
     IdAssigned(PeerId),
+    SuperIdAssigned(PeerId),
+    ParentAssigned(PeerId),
     NewPeer(PeerId),
     PeerLeft(PeerId),
     Signal {
         sender: PeerId,
         data: S,
+    },
+    SuperPeerSignal {
+        sender: PeerId, 
+        data: S, 
+        super_peer: bool
     },
 }
 
