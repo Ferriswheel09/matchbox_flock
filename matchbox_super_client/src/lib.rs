@@ -13,9 +13,8 @@ use std::time::Duration;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize)]
 struct Position {
-    #[serde(skip_serializing_if = "Option::is_none")]
     peer_id: Option<String>,
     x: i32,
     y: i32,
@@ -23,7 +22,7 @@ struct Position {
     y_velocity: i32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 enum Message {
     PositionUpdate(Position),
     Forward(Position),
@@ -34,7 +33,7 @@ enum Message {
 pub struct Client {
     // Identity
     peer_id: Option<PeerId>,
-    is_super: bool,
+    is_super: Option<bool>,
 
     // Positioning
     position: Rc<RefCell<Position>>,
@@ -42,20 +41,18 @@ pub struct Client {
 
     // Networking
     known_super_peers: Rc<RefCell<Vec<PeerId>>>, // Super-peers track other super-peers
-    socket: Option<WebRtcSocket>,
-    super_peer: Option<PeerId>, // Each client has a designated super-peer if they are a regular peer
+    parent_peer: Option<PeerId>, // Each client has a designated super-peer if they are a regular peer
     connected_peers: Rc<RefCell<Vec<PeerId>>>,
 }
 
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
-    pub fn new(is_super: bool) -> Client {
+    pub fn new() -> Client {
         Client {
             peer_id: None,
-            is_super,
-            socket: None,
-            super_peer: None,
+            is_super: None,
+            parent_peer: None,
             connected_peers: Rc::new(RefCell::new(Vec::new())),
             known_super_peers: Rc::new(RefCell::new(Vec::new())),
             peer_positions: Rc::new(RefCell::new(HashMap::new())),
@@ -133,10 +130,10 @@ impl Client {
     }
 
     // Need additional helper methods for state (debugging)
-    #[wasm_bindgen(getter)]
-    pub fn is_super_peer(&self) -> bool {
-        self.is_super
-    }
+    // #[wasm_bindgen(getter)]
+    // pub fn is_super_peer(&self) -> bool {
+    //     self.is_super
+    // }
 
     // get_all_positions: Returns the list of all peers and all of their positions
     // Necessary in order to get current state of all players (as well as if any dropped)
@@ -173,97 +170,97 @@ impl Client {
     }
 
     /// Gets the number of known super peers (only relevant for super peers).
-    #[wasm_bindgen(getter)]
-    pub fn known_super_peer_count(&self) -> usize {
-        if self.is_super {
-            self.known_super_peers.borrow().len()
-        } else {
-            0
-        }
-    }
+    // #[wasm_bindgen(getter)]
+    // pub fn known_super_peer_count(&self) -> usize {
+    //     if self.is_super {
+    //         self.known_super_peers.borrow().len()
+    //     } else {
+    //         0
+    //     }
+    // }
 
     // Broadcast method that, if the client is a super peer
     // Will send all messages to all super peers in the network
     // Who will then transmit all messages to all clients
     // TODO: Will need an abstraction before passing messages to all peers
-    #[wasm_bindgen]
-    pub fn broadcast_message(&mut self, packet: Packet) {
-        if self.is_super {
-            // Need to fix this relating to the channels
-            for peer in self.known_super_peers.borrow().iter() {
-                if let Some(socket) = &mut self.socket {
-                    socket.channel_mut(0).send(packet.clone(), *peer);
-                }
-            }
-            info!("Forwarded position update to super-peers.");
-        }
-    }
+    // #[wasm_bindgen]
+    // pub fn broadcast_message(&mut self, packet: Packet) {
+    //     if self.is_super {
+    //         // Need to fix this relating to the channels
+    //         for peer in self.known_super_peers.borrow().iter() {
+    //             if let Some(socket) = &mut self.socket {
+    //                 socket.channel_mut(0).send(packet.clone(), *peer);
+    //             }
+    //         }
+    //         info!("Forwarded position update to super-peers.");
+    //     }
+    // }
 
     // Sending method that the client can use to either
     // a. send to their correspondent super peer or
     // b. broadcast to the network if they are a regular peer
-    #[wasm_bindgen]
-    pub fn send(&mut self, packet: Packet) {
-        if self.is_super {
-            self.broadcast_message(packet);
-        } else {
-            if let Some(socket) = &mut self.socket {
-                if let Some(super_peer) = &self.super_peer {
-                    socket
-                        .channel_mut(0)
-                        .send(packet.clone(), super_peer.clone());
-                }
-            }
-        }
-    }
+    // #[wasm_bindgen]
+    // pub fn send(&mut self, packet: Packet) {
+    //     if self.is_super {
+    //         self.broadcast_message(packet);
+    //     } else {
+    //         if let Some(socket) = &mut self.socket {
+    //             if let Some(super_peer) = &self.super_peer {
+    //                 socket
+    //                     .channel_mut(0)
+    //                     .send(packet.clone(), super_peer.clone());
+    //             }
+    //         }
+    //     }
+    // }
 
     // Method that will send all peer information to another super peer
     // This will be useful if a new super peer joins the network
-    #[wasm_bindgen]
-    pub fn send_super_peer_list(&mut self) {
-        if self.is_super {
-            // Get the known super peers from the client to pass to the new connecting super peer
-            let peer_list: Vec<String> = self
-                .known_super_peers
-                .borrow()
-                .iter()
-                .map(|peer| peer.0.to_string()) // Extract Uuid from PeerId
-                .collect();
-            let msg = Message::PeerList(peer_list);
-            let packet = serde_json::to_vec(&msg).unwrap().into_boxed_slice();
+    // #[wasm_bindgen]
+    // pub fn send_super_peer_list(&mut self) {
+    //     if self.is_super {
+    //         // Get the known super peers from the client to pass to the new connecting super peer
+    //         let peer_list: Vec<String> = self
+    //             .known_super_peers
+    //             .borrow()
+    //             .iter()
+    //             .map(|peer| peer.0.to_string()) // Extract Uuid from PeerId
+    //             .collect();
+    //         let msg = Message::PeerList(peer_list);
+    //         let packet = serde_json::to_vec(&msg).unwrap().into_boxed_slice();
 
-            for peer in self.connected_peers.borrow().iter() {
-                if let Some(socket) = &mut self.socket {
-                    socket.channel_mut(0).send(packet.clone(), *peer);
-                }
-            }
-            info!("Super-peer sent peer list.");
-        }
-    }
+    //         for peer in self.connected_peers.borrow().iter() {
+    //             if let Some(socket) = &mut self.socket {
+    //                 socket.channel_mut(0).send(packet.clone(), *peer);
+    //             }
+    //         }
+    //         info!("Super-peer sent peer list.");
+    //     }
+    // }
 
     // Helper function that is necessary for new super peers entering the network
     // where given the list of super peers, add them to our local struct
     // TODO: What will happen if a peer gets promoted?
     // Maybe we send the peer list to every other peer for redundancy to limit the overhead
-    #[wasm_bindgen]
-    pub fn add_super_peer_list(&mut self, peer_list: Packet) {
-        // Check to make sure that the peer is super (shouldn't add to list otherwise)
-        if self.is_super {
-            let message: Message =
-                serde_json::from_slice(&peer_list).expect("Couldn't convert message to peer list");
-            match message {
-                Message::PeerList(peers) => {
-                    let mut peer_ref = self.known_super_peers.borrow_mut();
-                    for peer in peers {
-                        peer_ref.push(PeerId(
-                            Uuid::parse_str(&peer).expect("Couldn't conver to UUID"),
-                        ));
-                    }
-                }
-                _ => panic!("Expected peer list "),
-            }
-        }
-    }
+    // #[wasm_bindgen]
+    // pub fn add_super_peer_list(&mut self, peer_list: Packet) {
+    //     // Check to make sure that the peer is super (shouldn't add to list otherwise)
+    //     if self.is_super {
+    //         let message: Message =
+    //             serde_json::from_slice(&peer_list).expect("Couldn't convert message to peer list");
+    //         match message {
+    //             Message::PeerList(peers) => {
+    //                 let mut peer_ref = self.known_super_peers.borrow_mut();
+    //                 for peer in peers {
+    //                     peer_ref.push(PeerId(
+    //                         Uuid::parse_str(&peer).expect("Couldn't conver to UUID"),
+    //                     ));
+    //                 }
+    //             }
+    //             _ => panic!("Expected peer list "),
+    //         }
+    //     }
+    // }
 
     // Start method for the server
     #[wasm_bindgen]
@@ -277,26 +274,16 @@ impl Client {
         let connected_peers_ref = self.connected_peers.clone();
         let peer_positions_ref = self.peer_positions.clone();
         let known_super_peers_ref = self.known_super_peers.clone();
-        let is_super = self.is_super;
         let peer_id_ref = Rc::new(RefCell::new(self.peer_id.clone()));
-        let super_peer_ref = Rc::new(RefCell::new(self.super_peer.clone()));
-
-        // let turn_server = matchbox_socket::RtcIceServerConfig {
-        //     urls: vec![
-        //         "stun:184.72.189.6:3478".to_string(),
-        //         "turn:184.72.189.6:3478".to_string(),
-        //     ],
-        //     username: Some("youruser".to_string()),
-        //     credential: Some("yourpassword".to_string()),
-        // };
+        let parent_peer_ref = Rc::new(RefCell::new(self.parent_peer.clone()));
+        let is_super_ref = Rc::new(RefCell::new(self.is_super.clone()));
 
         // Spawn a future that will run the loop
         wasm_bindgen_futures::spawn_local(async move {
-            // Use the provided room URL or default to the AWS server
+            // Use the provided room URL or default to the local server
             let url = "ws://localhost:3536".to_string();
-            
+
             let (mut socket, loop_fut) = WebRtcSocketBuilder::new(&url)
-                // .ice_server(turn_server)
                 .add_unreliable_channel()
                 .build();
 
@@ -306,7 +293,7 @@ impl Client {
             let timeout = Delay::new(Duration::from_millis(100));
             futures::pin_mut!(timeout);
 
-            info!("P2P client started. Is super peer: {}", is_super);
+            let mut flag = false;
 
             loop {
                 // Update peer ID if not set
@@ -318,10 +305,30 @@ impl Client {
                     }
                 }
 
+                // Check for super peer or parent peer assignment
+                if !flag {
+                    if !socket.super_peer().is_none() {
+                        *is_super_ref.borrow_mut() = Some(socket.super_peer().unwrap());
+                        info!(
+                            "Socket created, super peer: {:?}",
+                            socket.super_peer().unwrap()
+                        );
+                        flag = true;
+                    } else if !socket.parent_peer().is_none() {
+                        *parent_peer_ref.borrow_mut() = Some(socket.parent_peer().unwrap());
+                        info!(
+                            "Socket created, parent peer: {:?}",
+                            socket.parent_peer().unwrap()
+                        );
+                        flag = true;
+                    }
+                }
+
                 // Process peer updates
                 for (peer, state) in socket.update_peers() {
                     let mut connected_peers = connected_peers_ref.borrow_mut();
                     let mut peer_positions = peer_positions_ref.borrow_mut();
+                    let is_super = is_super_ref.borrow().unwrap_or(false);
 
                     match state {
                         PeerState::Connected => {
@@ -342,10 +349,10 @@ impl Client {
                                     let packet = json_data.into_boxed_slice();
                                     socket.channel_mut(0).send(packet, peer);
                                 }
-                            } else if !is_super && super_peer_ref.borrow().is_none() {
-                                // Regular peer without a super-peer assigns the first one it sees
-                                *super_peer_ref.borrow_mut() = Some(peer);
-                                info!("Assigned super peer: {peer}");
+                            } else if !is_super && parent_peer_ref.borrow().is_none() {
+                                // Regular peer without a parent peer assigns the first one it sees
+                                *parent_peer_ref.borrow_mut() = Some(peer);
+                                info!("Assigned parent peer: {peer}");
                             }
                         }
                         PeerState::Disconnected => {
@@ -358,11 +365,11 @@ impl Client {
                                 super_peers.retain(|&p| p != peer);
                             }
 
-                            // If the disconnected peer was this client's super peer, clear it
-                            if let Some(current_super_peer) = *super_peer_ref.borrow() {
-                                if current_super_peer == peer {
-                                    *super_peer_ref.borrow_mut() = None;
-                                    info!("Super peer disconnected, looking for new super peer");
+                            // If the disconnected peer was this client's parent peer, clear it
+                            if let Some(current_parent_peer) = *parent_peer_ref.borrow() {
+                                if current_parent_peer == peer {
+                                    *parent_peer_ref.borrow_mut() = None;
+                                    info!("Parent peer disconnected, looking for new parent peer");
                                 }
                             }
 
@@ -375,6 +382,7 @@ impl Client {
                 {
                     let position = position_ref.borrow();
                     let connected_peers = connected_peers_ref.borrow();
+                    let is_super = is_super_ref.borrow().unwrap_or(false);
 
                     // Create a Position object with current state
                     let position_data = Position {
@@ -392,15 +400,15 @@ impl Client {
                     if let Ok(json_data) = serde_json::to_vec(&message) {
                         let packet = json_data.into_boxed_slice();
 
-                        // Broadcast or send to super peer based on client type
+                        // Broadcast or send to parent peer based on client type
                         if is_super {
                             // Super peers broadcast to all peers
                             for peer in connected_peers.iter() {
                                 socket.channel_mut(0).send(packet.clone(), *peer);
                             }
-                        } else if let Some(super_peer) = *super_peer_ref.borrow() {
-                            // Regular peers only send to their super peer
-                            socket.channel_mut(0).send(packet.clone(), super_peer);
+                        } else if let Some(parent_peer) = *parent_peer_ref.borrow() {
+                            // Regular peers only send to their parent peer
+                            socket.channel_mut(0).send(packet.clone(), parent_peer);
                         }
                     }
                 }
@@ -423,7 +431,7 @@ impl Client {
                                 );
 
                                 // If super peer, forward to all other peers
-                                if is_super {
+                                if is_super_ref.borrow().unwrap_or(false) {
                                     let forward_message = Message::Forward(position_data);
                                     if let Ok(forward_data) = serde_json::to_vec(&forward_message) {
                                         let forward_packet = forward_data.into_boxed_slice();
@@ -457,7 +465,7 @@ impl Client {
                             }
                             Message::PeerList(peers) => {
                                 // Only process peer list if we're a super peer
-                                if is_super {
+                                if is_super_ref.borrow().unwrap_or(false) {
                                     let mut super_peers = known_super_peers_ref.borrow_mut();
                                     for peer_str in peers {
                                         if let Ok(uuid) = Uuid::parse_str(&peer_str) {
@@ -487,9 +495,6 @@ impl Client {
                     }
                 }
             }
-
-            // We should update the original client with the new values
-            // but since we're in an async context, we can't directly modify self
         });
 
         Ok(())
