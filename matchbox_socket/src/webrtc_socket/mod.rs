@@ -67,7 +67,6 @@ async fn signaling_loop<S: Signaller>(
             message = signaller.next_message().fuse() => {
                 match message {
                     Ok(message) => {
-                        println!("Message: {}", message);
                         debug!("Received {message}");
                         let event: PeerEvent = serde_json::from_str(&message)
                             .unwrap_or_else(|err| panic!("couldn't parse peer event: {err}.\nEvent: {message}"));
