@@ -7,7 +7,6 @@ use matchbox_protocol::{JsonPeerEvent, PeerRequest};
 use matchbox_signaling::{
     common_logic::parse_request, ClientRequestError, NoCallbacks, SignalingTopology, WsStateMeta,
 };
-
 use tracing::{error, info, warn};
     
 /// A client server network topology
@@ -114,7 +113,7 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
 
 #[cfg(test)]
 mod tests {
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use matchbox_protocol::{JsonPeerEvent, PeerEvent, PeerId}; 
     use matchbox_signaling::SignalingServer;
     use std::{net::Ipv4Addr, str::FromStr};
@@ -444,5 +443,43 @@ mod tests {
                 assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::NewPeer(child_a_uuid));
             }  
         }
+    }
+    #[tokio::test]
+    async fn signal() {
+        let mut server = SignalingServer::client_server_builder((Ipv4Addr::LOCALHOST, 0)).build();
+        let addr = server.bind().unwrap();
+        tokio::spawn(server.serve());
+
+        let (mut host, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+        let _host_uuid = get_peer_id(recv_peer_event(&mut host).await);
+
+        let (mut client_a, _response) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+                .await
+                .unwrap();
+        let a_uuid = get_peer_id(recv_peer_event(&mut client_a).await);
+
+        let new_peer_event = recv_peer_event(&mut host).await;
+        let peer_uuid = match new_peer_event {
+            JsonPeerEvent::NewPeer(PeerId(peer_uuid)) => peer_uuid.to_string(),
+            _ => panic!("unexpected event"),
+        };
+
+        _ = client_a
+            .send(Message::text(format!(
+                "{{\"Signal\": {{\"receiver\": \"{peer_uuid}\", \"data\": \"123\" }}}}"
+            )))
+            .await;
+
+        let signal_event = recv_peer_event(&mut host).await;
+        assert_eq!(
+            signal_event,
+            JsonPeerEvent::Signal {
+                data: serde_json::Value::String("123".to_string()),
+                sender: a_uuid,
+            }
+        );
     }
 }
