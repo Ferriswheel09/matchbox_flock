@@ -1,0 +1,17 @@
+[package]
+name = "matchbox_hybrid_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+matchbox_socket = { path = "../matchbox_socket" }
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+log = { version = "0.4", default-features = false }
+console_error_panic_hook = "0.1.7"
+console_log = "1.0"
+futures = { version = "0.3", default-features = false }
+wasm-bindgen-futures = "0.4.29"
+wasm-bindgen = {version = "0.2", features = ["serde-serialize"]} 
+
+[lib]
+crate-type = ["cdylib", "rlib"]

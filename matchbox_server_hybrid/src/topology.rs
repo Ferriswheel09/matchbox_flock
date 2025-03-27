@@ -27,12 +27,13 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
         // Implement state machine logic for hybrid architechture
         if state.get_num_super_peers() < 2 {
             state.add_super_peer(peer_id, sender.clone());
+            info!("Added super peer {peer_id}");
         } else {
             state.add_child_peer(peer_id, sender.clone());
             if let Some(parent) = state.find_super_peer() {
                 match state.connect_child(peer_id, parent) {
                     Ok(_) => {
-                        info!("Connected {peer_id} to {parent}");
+                        info!("Connected CHILD:{peer_id} to PARENT:{parent}");
                     }
                     Err(e) => {
                         error!("error sending peer {peer_id} to super: {e:?}");

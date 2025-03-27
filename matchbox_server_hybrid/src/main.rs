@@ -38,6 +38,11 @@ async fn main() {
 
     let state = HybridState::default();
     let server = SignalingServerBuilder::new(args.host, HybridTopology, state.clone())
+        .on_connection_request(|connection| {
+            info!("Connecting: {connection:?}");
+            Ok(true) // Allow all connections
+        })
+        .on_id_assignment(|(socket, id)| info!("{socket} received {id}"))
         .cors()
         .trace()
         .mutate_router(|router| router.route("/health", get(health_handler)))
