@@ -8,6 +8,8 @@ use matchbox_signaling::{
     common_logic::parse_request, ClientRequestError, NoCallbacks, SignalingTopology, WsStateMeta,
 };
 use tracing::{error, info, warn};
+
+//const PEER_RATIO: usize = 4;
     
 /// A client server network topology
 #[derive(Debug, Default)]
@@ -25,12 +27,37 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
         } = upgrade;
 
         // Implement state machine logic for hybrid architechture
+        // If there are no super peers
         if state.get_num_super_peers() < 2 {
             state.add_super_peer(peer_id, sender.clone());
             info!("Added super peer {peer_id}");
+            /* 
+        // If super peer to child peer ratio is greater than PEER_RATIO
+        } else if state.get_num_child_peers() / state.get_num_super_peers() >= PEER_RATIO {
+            // Compare this peer's bandwidth to all child peer bandwidths
+
+            // If this peer has more bandwidth than all child peers, add as super peer
+            // Rebalance child peers among super peers
+
+            // Else add highest bandwidth child peer as super peer
+            // Add this peer as child peer
+            // Rebalance child peers among super peers
+
+            state.add_super_peer(peer_id, sender.clone());
+            info!("Added super peer {peer_id}");
+        // New super peer not needed, add as child peer
+        */
         } else {
+            // Compare this peer's bandwidth to all super peer bandwidths
+
+            // If this peer has higher bandwidth than one super peer
+            // Add this peer as a super peer
+            // Transfer children of lowest bandwidth super peer to this peer
+            // Make lowest bandwidth super peer a child peer and connect to least loaded super peer
+
+            // Else add this peer as a child peer and connect to least loaded super peer
             state.add_child_peer(peer_id, sender.clone());
-            if let Some(parent) = state.find_super_peer() {
+            if let Some(parent) = state.find_least_loaded_super_peer() {
                 match state.connect_child(peer_id, parent) {
                     Ok(_) => {
                         info!("Connected CHILD:{peer_id} to PARENT:{parent}");
@@ -45,8 +72,6 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                 error!("error finding super peer");
             }
         }
-
-        let super_peer = state.is_super_peer(&peer_id);
 
          // The state machine for the data channel established for this websocket.
          while let Some(request) = receiver.next().await {
@@ -66,11 +91,11 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                             continue; // Recoverable error
                         }
                     };
-                    if super_peer {
-                        state.remove_super_peer(&peer_id);
+                    if state.is_super_peer(&peer_id){
+                        state.remove_super_peer(peer_id);
 
                     } else {
-                        state.remove_child_peer(&peer_id);
+                        state.remove_child_peer(peer_id);
                     }
                     return;
                 }
@@ -86,15 +111,13 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                         .to_string(),
                     );
                     if let Err(e) = {
-                        if state.is_super_peer(&receiver) {
-                            state.try_send_to_super_peer(receiver, event)
-                        } else {
-                            state.try_send_to_child_peer(receiver, event)
-                        }
+                        state.try_send_to_peer(receiver, event)
                     } {
                         error!("error sending signal event: {e:?}");
                     }
                 }
+                // PeerRequest::UpdateBandwidth
+
                 PeerRequest::KeepAlive => {
                     // Do nothing. KeepAlive packets are used to protect against idle websocket
                     // connections getting automatically disconnected, common for reverse proxies.
@@ -102,10 +125,19 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
             }
         }
 
-        if super_peer {
-            state.remove_super_peer(&peer_id);
+        if state.is_super_peer(&peer_id) {
+            // Is child peer to super peer ratio low?
+
+            // If so, remove super peer
+            // Rebalance child peers among super peers
+
+            // Else find child peer with highest bandwidth
+            // Make that child peer a super peer
+            // Transfer children of leaving super peer to new super peer
+            // Remove leaving super peer
+            state.remove_super_peer(peer_id);
         } else {
-            state.remove_child_peer(&peer_id);
+            state.remove_child_peer(peer_id);
             // Lifecycle event: On ChildPeer Disonnected
         }
         
