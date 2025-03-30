@@ -7,5 +7,6 @@ members = [
   "matchbox_signaling",
   "examples/*", 
   "matchbox_super_client",
+  "matchbox_superer_client",
 ]
 resolver = "2" # Important! Bevy/WGPU needs this!
