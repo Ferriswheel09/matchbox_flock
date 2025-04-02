@@ -3605,8 +3605,11 @@ dependencies = [
  "futures-timer",
  "log",
  "matchbox_socket",
- "tokio",
- "tracing-subscriber",
+ "serde",
+ "serde-wasm-bindgen 0.4.5",
+ "serde_json",
+ "uuid",
+ "wasm-bindgen",
  "wasm-bindgen-futures 0.4.49",
 ]
 

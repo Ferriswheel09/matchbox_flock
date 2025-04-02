@@ -2,368 +2,463 @@ use futures::{select, FutureExt};
 use futures_timer::Delay;
 use log::info;
 use matchbox_socket::{PeerId, PeerState, WebRtcSocket, WebRtcSocketBuilder};
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
+use uuid::Uuid;
+use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::js_sys;
 
 const CHANNEL_ID: usize = 0;
 const HANDSHAKE_RETRY_INTERVAL_MS: u64 = 1000; // Retry every 1 second
 const MAX_HANDSHAKE_ATTEMPTS: u8 = 5; // Maximum retry attempts
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum PeerRole {
     Super,
     Child,
 }
 
+#[derive(Serialize, Deserialize)]
 struct HandshakeState {
     attempts: u8,
-    last_attempt: std::time::Instant,
     acknowledged: bool,
 }
 
-impl HandshakeState {
-    fn new() -> Self {
+#[wasm_bindgen]
+pub struct Client {
+    // All fields are now wrapped in Rc<RefCell<...>>.
+    info: Rc<RefCell<String>>,
+    peer_info: Rc<RefCell<HashMap<PeerId, String>>>,
+    super_peers: Rc<RefCell<HashMap<PeerId, String>>>, // Map peer id to any additional info
+    child_peers: Rc<RefCell<HashMap<PeerId, String>>>,
+    peer_handshake_states: Rc<RefCell<HashMap<PeerId, HandshakeState>>>,
+}
+
+#[wasm_bindgen]
+impl Client {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
         Self {
-            attempts: 0,
-            last_attempt: std::time::Instant::now(),
-            acknowledged: false,
+            info: Rc::new(RefCell::new(String::new())),
+            peer_info: Rc::new(RefCell::new(HashMap::new())),
+            super_peers: Rc::new(RefCell::new(HashMap::new())),
+            child_peers: Rc::new(RefCell::new(HashMap::new())),
+            peer_handshake_states: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
-    fn should_retry(&self) -> bool {
-        !self.acknowledged
-            && self.attempts < MAX_HANDSHAKE_ATTEMPTS
-            && self.last_attempt.elapsed() >= Duration::from_millis(HANDSHAKE_RETRY_INTERVAL_MS)
+    #[wasm_bindgen]
+    pub fn set_info(&mut self, info: String) {
+        // Update the RefCell content for info
+        *self.info.borrow_mut() = info;
     }
 
-    fn record_attempt(&mut self) {
-        self.attempts += 1;
-        self.last_attempt = std::time::Instant::now();
+    #[wasm_bindgen(getter)]
+    pub fn info(&self) -> String {
+        self.info.borrow().clone()
     }
 
-    fn acknowledge(&mut self) {
-        self.acknowledged = true;
+    #[wasm_bindgen]
+    pub fn add_peer_info(&mut self, peer_id: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer_id).expect("Not a valid Peer ID");
+        let peer_id = PeerId(peer_uuid);
+        self.peer_info.borrow_mut().insert(peer_id, info.clone());
     }
-}
 
-struct NetworkState {
-    super_peers: HashMap<PeerId, String>, // Map peer id to any additional info
-    child_peers: HashMap<PeerId, String>,
-    peer_handshake_states: HashMap<PeerId, HandshakeState>,
-}
-
-impl NetworkState {
-    fn new() -> Self {
-        Self {
-            super_peers: HashMap::new(),
-            child_peers: HashMap::new(),
-            peer_handshake_states: HashMap::new(),
+    #[wasm_bindgen]
+    pub fn getAllInfo(&self) -> js_sys::Map {
+        let result = js_sys::Map::new();
+        for (peer_id, info) in self.peer_info.borrow().iter() {
+            info!("Peer: {} => {}", peer_id, info);
+            let peer_id_str = peer_id.to_string();
+            let peer_id_js = wasm_bindgen::JsValue::from_str(&peer_id_str);
+            let info_js = wasm_bindgen::JsValue::from_str(info);
+            result.set(&peer_id_js, &info_js);
         }
+        // Log the size of the map
+        info!("Peer info map size: {}", self.peer_info.borrow().len());
+        result
     }
 
-    fn add_super_peer(&mut self, peer: PeerId, info: String) {
-        self.super_peers.insert(peer, info);
+    #[wasm_bindgen]
+    pub fn add_super_peer(&mut self, peer: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+        self.super_peers.borrow_mut().insert(peer_id, info.clone());
     }
 
-    fn add_child_peer(&mut self, peer: PeerId, info: String) {
-        self.child_peers.insert(peer, info);
+    #[wasm_bindgen]
+    pub fn add_child_peer(&mut self, peer: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+        self.child_peers.borrow_mut().insert(peer_id, info.clone());
     }
 
-    fn remove_peer(&mut self, peer: PeerId) {
-        self.super_peers.remove(&peer);
-        self.child_peers.remove(&peer);
-        self.peer_handshake_states.remove(&peer);
+    #[wasm_bindgen]
+    pub fn remove_peer(&mut self, peer: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+
+        self.super_peers.borrow_mut().remove(&peer_id);
+        self.child_peers.borrow_mut().remove(&peer_id);
+        self.peer_handshake_states.borrow_mut().remove(&peer_id);
+        self.peer_info.borrow_mut().remove(&peer_id);
     }
 
-    fn print_state(&self) {
-        info!(
-            "Network State -> Super Peers: {:?} | Child Peers: {:?}",
-            self.super_peers, self.child_peers
-        );
-    }
-
-    fn get_peers_to_retry(&self) -> Vec<PeerId> {
+    // Get peers to retry the handshake (peers with less than MAX_HANDSHAKE_ATTEMPTS and not acknowledged)
+    #[wasm_bindgen]
+    pub fn get_peers_to_retry(&self) -> Vec<String> {
         self.peer_handshake_states
+            .borrow()
             .iter()
-            .filter(|(_, state)| state.should_retry())
-            .map(|(peer_id, _)| *peer_id)
+            .filter(|(_, state)| state.attempts < MAX_HANDSHAKE_ATTEMPTS && !state.acknowledged)
+            .map(|(peer_id, _)| peer_id.to_string())
             .collect()
     }
-}
 
-#[cfg(target_arch = "wasm32")]
-fn main() {
-    // Setup logging for wasm
-    console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Debug).unwrap();
-    wasm_bindgen_futures::spawn_local(async_main());
-}
+    // Modified helper to take the handshake state map from self.
+    fn send_handshake(
+        socket: &mut WebRtcSocket,
+        handshake_states: &Rc<RefCell<HashMap<PeerId, HandshakeState>>>,
+        peer: String,
+        handshake_msg: &str,
+    ) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
 
-#[cfg(not(target_arch = "wasm32"))]
-#[tokio::main]
-async fn main() {
-    // Setup logging for native
-    use tracing_subscriber::prelude::*;
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "simple_example=info,matchbox_socket=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    async_main().await
-}
-
-async fn async_main() {
-    info!("Connecting to matchbox");
-
-    // Build the socket (optionally, add your TURN/stun config here)
-    let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://localhost:3536/")
-        .add_reliable_channel()
-        .build();
-
-    let loop_fut = loop_fut.fuse();
-    futures::pin_mut!(loop_fut);
-
-    // Track whether the socket has determined its role.
-    let mut initialized = false;
-    // Create a network state instance to track connected peers.
-    let mut network_state = NetworkState::new();
-
-    // Store the parent peer ID when we're a child.
-    let mut parent_id: Option<PeerId> = None;
-    // Store our own role.
-    let mut self_role: Option<PeerRole> = None;
-
-    // Used for maintaining the loop timeout.
-    let timeout = Delay::new(Duration::from_millis(100));
-    futures::pin_mut!(timeout);
-
-    // Cache of messages to prevent duplicate forwarding.
-    let mut seen_messages: HashSet<String> = HashSet::new();
-
-    loop {
-        // Determine our own role once on start.
-        if !initialized {
-            if let Some(super_peer) = socket.super_peer() {
-                info!("Socket created as super peer: {:?}", super_peer);
-                self_role = Some(PeerRole::Super);
-                initialized = true;
-            } else if let Some(parent) = socket.parent_peer() {
-                info!("Socket created as child peer (parent: {:?})", parent);
-                parent_id = Some(parent);
-                self_role = Some(PeerRole::Child);
-                initialized = true;
-            }
+        if let Some(state) = handshake_states.borrow_mut().get_mut(&peer_id) {
+            info!(
+                "Sending handshake to {}: {} (attempt {})",
+                peer,
+                handshake_msg,
+                state.attempts + 1
+            );
+            let packet = handshake_msg.as_bytes().to_vec().into_boxed_slice();
+            socket.channel_mut(CHANNEL_ID).send(packet, peer_id);
+            state.attempts += 1;
         }
+    }
 
-        // Handle new peer connections/disconnections.
-        for (peer, state) in socket.update_peers() {
-            match state {
-                PeerState::Connected => {
-                    info!("Peer joined: {}", peer);
+    #[wasm_bindgen]
+    pub fn start(&mut self) -> Result<(), wasm_bindgen::JsValue> {
+        console_error_panic_hook::set_once();
+        console_log::init_with_level(log::Level::Debug).unwrap();
 
-                    // Initialize handshake state for the new peer.
-                    network_state
-                        .peer_handshake_states
-                        .insert(peer, HandshakeState::new());
+        info!("Connecting to matchbox");
 
-                    // For super peers, send handshake to any new peer.
-                    if let Some(PeerRole::Super) = self_role {
-                        send_handshake(&mut socket, &mut network_state, peer, "super_handshake");
-                    }
-                    // For child peers, check if this is our parent.
-                    else if let Some(parent) = parent_id {
-                        if peer == parent {
-                            info!("Parent peer connection established");
-                            send_handshake(&mut socket, &mut network_state, peer, "child_handshake");
-                        }
-                    }
-                }
-                PeerState::Disconnected => {
-                    info!("Peer left: {}", peer);
-                    network_state.remove_peer(peer);
-                    network_state.print_state();
-                }
-            }
-        }
+        // Clone self’s inner Rc values to use within the async block.
+        let info_rc = self.info.clone();
+        let peer_info_rc = self.peer_info.clone();
+        let super_peers_rc = self.super_peers.clone();
+        let child_peers_rc = self.child_peers.clone();
+        let handshake_states_rc = self.peer_handshake_states.clone();
 
-        if let Some(my_peer_id) = socket.id() {
-            match self_role {
-                Some(PeerRole::Super) => {
-                    // Send a hello message to all other super peers.
-                    for super_peer in network_state.super_peers.keys() {
-                        let hello_msg = format!("hello_super_peer|{}", my_peer_id);
-                        let packet = hello_msg.as_bytes().to_vec().into_boxed_slice();
-                        socket.channel_mut(CHANNEL_ID).send(packet, *super_peer);
-                    }
-                    // Additionally, send a message to all my child peers.
-                    for child_peer in network_state.child_peers.keys() {
-                        let hello_msg = format!("hello_super_peer|{}", my_peer_id);
-                        let packet = hello_msg.as_bytes().to_vec().into_boxed_slice();
-                        socket.channel_mut(CHANNEL_ID).send(packet, *child_peer);
+        wasm_bindgen_futures::spawn_local(async move {
+            let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://localhost:3536/")
+                .add_reliable_channel()
+                .reconnect_attempts(Some(5))
+                .build();
+
+            let mut loop_fut = loop_fut.fuse();
+            futures::pin_mut!(loop_fut);
+
+            let mut initialized = false;
+            let mut parent_id: Option<PeerId> = None;
+            let mut self_role: Option<PeerRole> = None;
+
+            let mut timeout = Delay::new(Duration::from_millis(100));
+            futures::pin_mut!(timeout);
+
+            loop {
+                // Determine our role once on start.
+                if !initialized {
+                    if let Some(super_peer) = socket.super_peer() {
+                        info!("Socket created as super peer: {:?}", super_peer);
+                        self_role = Some(PeerRole::Super);
+                        initialized = true;
+                    } else if let Some(parent) = socket.parent_peer() {
+                        info!("Socket created as child peer (parent: {:?})", parent);
+                        parent_id = Some(parent);
+                        self_role = Some(PeerRole::Child);
+                        initialized = true;
                     }
                 }
-                Some(PeerRole::Child) => {
-                    // Ensure parent has acknowledged before sending a hello message.
-                    if let Some(parent) = parent_id {
-                        if let Some(state) = network_state.peer_handshake_states.get(&parent) {
-                            if state.acknowledged {
-                                let hello_msg = format!("hello_parent|{}", my_peer_id);
-                                let packet = hello_msg.as_bytes().to_vec().into_boxed_slice();
-                                socket.channel_mut(CHANNEL_ID).send(packet, parent);
-                            } else {
-                                info!(
-                                    "Waiting for parent {} to acknowledge before sending hello message",
-                                    parent
+
+                // Handle new peer connections/disconnections.
+                for (peer, state) in socket.update_peers() {
+                    match state {
+                        PeerState::Connected => {
+                            info!("Peer joined: {}", peer);
+                            handshake_states_rc.borrow_mut().insert(
+                                peer,
+                                HandshakeState {
+                                    attempts: 0,
+                                    acknowledged: false,
+                                },
+                            );
+
+                            if let Some(PeerRole::Super) = self_role {
+                                Self::send_handshake(
+                                    &mut socket,
+                                    &handshake_states_rc,
+                                    peer.to_string(),
+                                    "super_handshake",
                                 );
-                            }
-                        }
-                    }
-                }
-                None => {}
-            }
-        }
-
-        // Process incoming messages.
-        for (peer, packet) in socket.channel_mut(CHANNEL_ID).receive() {
-            let message = String::from_utf8_lossy(&packet).to_string();
-
-            info!("Message from {}: {}", peer, message);
-
-            // Process handshake messages.
-            match message.as_str() {
-                "super_handshake" => {
-                    if let Some(PeerRole::Super) = self_role {
-                        network_state.add_super_peer(peer, "OtherSuperPeer".to_string());
-                        info!("Discovered another super peer: {}", peer);
-
-                        let ack_msg = "super_handshake_ack";
-                        info!("Sending super peer acknowledgment to {}: {}", peer, ack_msg);
-                        let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
-                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
-                    } else {
-                        network_state.add_super_peer(peer, "SuperPeerInfo".to_string());
-                        info!("Received super peer handshake from {}", peer);
-
-                        let ack_msg = "super_handshake_ack";
-                        info!("Sending acknowledgment to super peer {}: {}", peer, ack_msg);
-                        let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
-                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
-                    }
-                    network_state.print_state();
-                }
-                "super_handshake_ack" => {
-                    if let Some(state) = network_state.peer_handshake_states.get_mut(&peer) {
-                        state.acknowledge();
-                        info!("Super peer handshake acknowledged by {}", peer);
-                    }
-                    if let Some(PeerRole::Super) = self_role {
-                        network_state.add_super_peer(peer, "OtherSuperPeer".to_string());
-                        info!("Confirmed another super peer: {}", peer);
-                        network_state.print_state();
-                    }
-                }
-                "child_handshake" => {
-                    network_state.add_child_peer(peer, "ChildPeerInfo".to_string());
-                    info!("Received child peer handshake from {}", peer);
-
-                    let ack_msg = "child_handshake_ack";
-                    info!("Sending acknowledgement to child {}: {}", peer, ack_msg);
-                    let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
-                    socket.channel_mut(CHANNEL_ID).send(packet, peer);
-
-                    network_state.print_state();
-                }
-                "child_handshake_ack" => {
-                    if let Some(state) = network_state.peer_handshake_states.get_mut(&peer) {
-                        state.acknowledge();
-                        info!("Child handshake acknowledged by parent {}", peer);
-                    }
-                }
-                _ => {
-                    // Non-handshake messages get processed here.
-                    info!("Received message from {}: {}", peer, message);
-
-                    // Only super peers forward messages.
-                    if let Some(PeerRole::Super) = self_role {
-                        // Forward non-handshake messages appropriately:
-                        // Check if the sender is a child peer.
-                        if network_state.child_peers.contains_key(&peer) {
-                            // Forward to all child peers and super peers (except the sender).
-                            for child_peer in network_state.child_peers.keys() {
-                                if *child_peer != peer {
-                                    socket.channel_mut(CHANNEL_ID)
-                                        .send(packet.clone(), *child_peer);
-                                }
-                            }
-                            for super_peer in network_state.super_peers.keys() {
-                                if *super_peer != peer {
-                                    socket.channel_mut(CHANNEL_ID)
-                                        .send(packet.clone(), *super_peer);
+                            } else if let Some(parent) = parent_id {
+                                if peer == parent {
+                                    info!("Parent peer connection established");
+                                    Self::send_handshake(
+                                        &mut socket,
+                                        &handshake_states_rc,
+                                        peer.to_string(),
+                                        "child_handshake",
+                                    );
                                 }
                             }
                         }
-                        // Otherwise, if the sender is a super peer.
-                        else if network_state.super_peers.contains_key(&peer) {
-                            // Forward only to child peers.
-                            for child_peer in network_state.child_peers.keys() {
-                                socket.channel_mut(CHANNEL_ID)
-                                    .send(packet.clone(), *child_peer);
-                            }
+                        PeerState::Disconnected => {
+                            info!("Peer left: {}", peer);
+                            // Remove from all client maps.
+                            super_peers_rc.borrow_mut().remove(&peer);
+                            child_peers_rc.borrow_mut().remove(&peer);
+                            handshake_states_rc.borrow_mut().remove(&peer);
+                            peer_info_rc.borrow_mut().remove(&peer);
                         }
                     }
                 }
-            }
-        }
 
-        // Maintain the loop with a timeout.
-        select! {
-            _ = (&mut timeout).fuse() => {
-                timeout.reset(Duration::from_millis(500));
-
-                // Check for peers that need handshake retries.
-                let peers_to_retry = network_state.get_peers_to_retry();
-                for peer in peers_to_retry {
+                // Send our info based on our role.
+                if let Some(my_peer_id) = socket.id() {
                     match self_role {
                         Some(PeerRole::Super) => {
-                            send_handshake(&mut socket, &mut network_state, peer, "super_handshake");
-                        },
-                        Some(PeerRole::Child) => {
-                            if let Some(parent) = parent_id {
-                                if peer == parent {
-                                    send_handshake(&mut socket, &mut network_state, peer, "child_handshake");
+                            for peer in super_peers_rc.borrow().keys() {
+                                if let Some(state) = handshake_states_rc.borrow().get(peer) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, *peer);
+                                    }
                                 }
                             }
-                        },
+                            for peer in child_peers_rc.borrow().keys() {
+                                if let Some(state) = handshake_states_rc.borrow().get(peer) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, *peer);
+                                    }
+                                }
+                            }
+                        }
+                        Some(PeerRole::Child) => {
+                            if let Some(parent) = parent_id {
+                                if let Some(state) = handshake_states_rc.borrow().get(&parent) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, parent);
+                                    }
+                                }
+                            }
+                        }
                         None => {}
                     }
                 }
-            }
-            _ = &mut loop_fut => {
-                break;
-            }
-        }
-    }
-}
 
-// Helper function to send handshakes and update the handshake state.
-fn send_handshake(
-    socket: &mut WebRtcSocket,
-    network_state: &mut NetworkState,
-    peer: PeerId,
-    handshake_msg: &str,
-) {
-    if let Some(state) = network_state.peer_handshake_states.get_mut(&peer) {
-        info!(
-            "Sending handshake to {}: {} (attempt {})",
-            peer,
-            handshake_msg,
-            state.attempts + 1
-        );
-        let packet = handshake_msg.as_bytes().to_vec().into_boxed_slice();
-        socket.channel_mut(CHANNEL_ID).send(packet, peer);
-        state.record_attempt();
+                // Process incoming messages.
+                for (peer, packet) in socket.channel_mut(CHANNEL_ID).receive() {
+                    let message = String::from_utf8_lossy(&packet).to_string();
+
+                    if message.starts_with("info|") {
+                        let parts: Vec<&str> = message.splitn(3, '|').collect();
+                        if parts.len() == 3 {
+                            let sender_id_str = parts[1];
+                            let actual_info = parts[2].to_string();
+                            if let Ok(sender_uuid) = Uuid::parse_str(sender_id_str) {
+                                let sender_id = PeerId(sender_uuid);
+                                info!(
+                                    "Received info originally from {}: {}",
+                                    sender_id, actual_info
+                                );
+                                peer_info_rc.borrow_mut().insert(sender_id, actual_info);
+
+                                if let Some(PeerRole::Super) = self_role {
+                                    for child_peer in child_peers_rc.borrow().keys() {
+                                        if *child_peer != peer {
+                                            socket
+                                                .channel_mut(CHANNEL_ID)
+                                                .send(packet.clone(), *child_peer);
+                                            info!("Forwarded info to child peer: {}", child_peer);
+                                        }
+                                    }
+                                    for super_peer in super_peers_rc.borrow().keys() {
+                                        if *super_peer != peer {
+                                            socket
+                                                .channel_mut(CHANNEL_ID)
+                                                .send(packet.clone(), *super_peer);
+                                            info!("Forwarded info to super peer: {}", super_peer);
+                                        }
+                                    }
+                                }
+                            } else {
+                                info!("Error parsing sender ID in info message: invalid UUID");
+                            }
+                        } else {
+                            info!("Received malformed info message: {}", message);
+                        }
+                    } else if message == "super_handshake" {
+                        if let Some(PeerRole::Super) = self_role {
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "OtherSuperPeer".to_string());
+                            info!("Discovered another super peer: {}", peer);
+
+                            let ack_msg = "super_handshake_ack";
+                            info!("Sending super peer acknowledgment to {}: {}", peer, ack_msg);
+                            let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                            socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                        } else {
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "SuperPeerInfo".to_string());
+                            info!("Received super peer handshake from {}", peer);
+
+                            let ack_msg = "super_handshake_ack";
+                            info!("Sending acknowledgment to super peer {}: {}", peer, ack_msg);
+                            let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                            socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                        }
+                    } else if message == "super_handshake_ack" {
+                        if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
+                            if let Some(state) = states.get_mut(&peer) {
+                                state.acknowledged = true;
+                                info!("Super peer handshake acknowledged by {}", peer);
+                                if let Some(my_peer_id) = socket.id() {
+                                    let info_msg =
+                                        format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                    let packet = info_msg.as_bytes().to_vec().into_boxed_slice();
+                                    socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                                    info!("Sent info after super peer handshake ack: {}", info_msg);
+                                }
+                            }
+                        }
+                        if let Some(PeerRole::Super) = self_role {
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "OtherSuperPeer".to_string());
+                            info!("Confirmed another super peer: {}", peer);
+                        }
+                    } else if message == "child_handshake" {
+                        child_peers_rc
+                            .borrow_mut()
+                            .insert(peer, "ChildPeerInfo".to_string());
+                        info!("Received child peer handshake from {}", peer);
+
+                        let ack_msg = "child_handshake_ack";
+                        info!("Sending acknowledgement to child {}: {}", peer, ack_msg);
+                        let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                    } else if message == "child_handshake_ack" {
+                        if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
+                            if let Some(state) = states.get_mut(&peer) {
+                                state.acknowledged = true;
+                                info!("Child handshake acknowledged by parent {}", peer);
+                                if let Some(my_peer_id) = socket.id() {
+                                    let info_msg =
+                                        format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                    let packet = info_msg.as_bytes().to_vec().into_boxed_slice();
+                                    socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                                    info!("Sent info after child handshake ack: {}", info_msg);
+                                }
+                            }
+                        }
+                    } else {
+                        info!("Received other message from {}: {}", peer, message);
+                        if let Some(PeerRole::Super) = self_role {
+                            if child_peers_rc.borrow().contains_key(&peer) {
+                                for child_peer in child_peers_rc.borrow().keys() {
+                                    if *child_peer != peer {
+                                        socket
+                                            .channel_mut(CHANNEL_ID)
+                                            .send(packet.clone(), *child_peer);
+                                        info!("Forwarded message to child peer: {}", child_peer);
+                                    }
+                                }
+                                for super_peer in super_peers_rc.borrow().keys() {
+                                    if *super_peer != peer {
+                                        socket
+                                            .channel_mut(CHANNEL_ID)
+                                            .send(packet.clone(), *super_peer);
+                                        info!("Forwarded message to super peer: {}", super_peer);
+                                    }
+                                }
+                            } else if super_peers_rc.borrow().contains_key(&peer) {
+                                for child_peer in child_peers_rc.borrow().keys() {
+                                    socket
+                                        .channel_mut(CHANNEL_ID)
+                                        .send(packet.clone(), *child_peer);
+                                    info!(
+                                        "Forwarded message from super peer to child: {}",
+                                        child_peer
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Maintain the loop with a timeout.
+                select! {
+                    _ = (&mut timeout).fuse() => {
+                        timeout.reset(Duration::from_millis(100));
+                        let peers_to_retry: Vec<String> = handshake_states_rc.borrow()
+                            .iter()
+                            .filter(|(_, state)| state.attempts < MAX_HANDSHAKE_ATTEMPTS && !state.acknowledged)
+                            .map(|(peer_id, _)| peer_id.to_string())
+                            .collect();
+                        for peer in peers_to_retry {
+                            match self_role {
+                                Some(PeerRole::Super) => {
+                                    Self::send_handshake(
+                                        &mut socket,
+                                        &handshake_states_rc,
+                                        peer,
+                                        "super_handshake",
+                                    );
+                                },
+                                Some(PeerRole::Child) => {
+                                    if let Some(parent) = parent_id {
+                                        if peer == parent.to_string() {
+                                            Self::send_handshake(
+                                                &mut socket,
+                                                &handshake_states_rc,
+                                                peer,
+                                                "child_handshake",
+                                            );
+                                        }
+                                    }
+                                },
+                                None => {}
+                            }
+                        }
+                    }
+                    _ = &mut loop_fut => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 }
