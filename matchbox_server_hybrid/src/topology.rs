@@ -5,13 +5,13 @@ use axum::extract::ws::Message;
 use futures::StreamExt;
 use matchbox_protocol::{JsonPeerEvent, PeerRequest};
 use matchbox_signaling::{
-    common_logic::parse_request, ClientRequestError, NoCallbacks, SignalingTopology, WsStateMeta,
+    common_logic::parse_request, ClientRequestError, NoCallbacks, SignalingTopology, WsStateMeta, 
 };
 use tracing::{error, info, warn};
 
-//const PEER_RATIO: usize = 4;
+pub const PEER_RATIO: usize = 4;
     
-/// A client server network topology
+/// A hybrid network topology
 #[derive(Debug, Default)]
 pub struct HybridTopology;
 
@@ -26,36 +26,26 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
             ..
         } = upgrade;
 
-        // Implement state machine logic for hybrid architechture
-        // If there are no super peers
-        if state.get_num_super_peers() < 2 {
+        if state.should_add_super_peer(PEER_RATIO) {
+            //TODO: Implement logic to assign super peers based off bandwidth
+            //-----------------------------------------------------------------------------------
+            // If an existing child have higher bandwidth than new peer
+            //      Make that child a new super peer and make new peer a child peer, load balance
+            // Else
+            //      Make new peer a super peer, load balance
+            //-----------------------------------------------------------------------------------
             state.add_super_peer(peer_id, sender.clone());
+            state.load_balance();
             info!("Added super peer {peer_id}");
-            /* 
-        // If super peer to child peer ratio is greater than PEER_RATIO
-        } else if state.get_num_child_peers() / state.get_num_super_peers() >= PEER_RATIO {
-            // Compare this peer's bandwidth to all child peer bandwidths
-
-            // If this peer has more bandwidth than all child peers, add as super peer
-            // Rebalance child peers among super peers
-
-            // Else add highest bandwidth child peer as super peer
-            // Add this peer as child peer
-            // Rebalance child peers among super peers
-
-            state.add_super_peer(peer_id, sender.clone());
-            info!("Added super peer {peer_id}");
-        // New super peer not needed, add as child peer
-        */
         } else {
-            // Compare this peer's bandwidth to all super peer bandwidths
-
-            // If this peer has higher bandwidth than one super peer
-            // Add this peer as a super peer
-            // Transfer children of lowest bandwidth super peer to this peer
-            // Make lowest bandwidth super peer a child peer and connect to least loaded super peer
-
-            // Else add this peer as a child peer and connect to least loaded super peer
+            //TODO: Implement logic to handle new child peers based off bandwidth
+            //-----------------------------------------------------------------------------------
+            // If the new peer a better candidate for super peer than existing super peers
+            //      Replace worst existing super peer with new peer, transfer children to new peer
+            //      Add old super peer as child of least loaded super peer
+            // Else
+            //      Add new peer as  child of least loaded super peer
+            //-----------------------------------------------------------------------------------
             state.add_child_peer(peer_id, sender.clone());
             if let Some(parent) = state.find_least_loaded_super_peer() {
                 match state.connect_child(peer_id, parent) {
@@ -116,6 +106,8 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                         error!("error sending signal event: {e:?}");
                     }
                 }
+                // TODO: Add custom hybrid events
+                // PeerRequest::GetChildren
                 // PeerRequest::UpdateBandwidth
 
                 PeerRequest::KeepAlive => {
@@ -124,21 +116,22 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                 }
             }
         }
-
+        
+        // If we have reached here the peer is leaving the network
         if state.is_super_peer(&peer_id) {
-            // Is child peer to super peer ratio low?
-
-            // If so, remove super peer
-            // Rebalance child peers among super peers
-
-            // Else find child peer with highest bandwidth
-            // Make that child peer a super peer
-            // Transfer children of leaving super peer to new super peer
-            // Remove leaving super peer
+            // TODO: Implement dynamic super peer removal taking bandwidth into consideration
+            //-----------------------------------------------------------------------------------
+            // If child peer to super peer ratio low
+            //      Remove super peer and load balance
+            // Else 
+            //      Find child peer with highest bandwidth
+            //      Make that child peer a super peer
+            //      Transfer children of leaving super peer to new super peer
+            //      Remove leaving super peer
+            //-----------------------------------------------------------------------------------
             state.remove_super_peer(peer_id);
         } else {
             state.remove_child_peer(peer_id);
-            // Lifecycle event: On ChildPeer Disonnected
         }
         
     }
@@ -146,15 +139,33 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
 
 #[cfg(test)]
 mod tests {
-    use futures::{SinkExt, StreamExt};
-    use matchbox_protocol::{JsonPeerEvent, PeerEvent, PeerId}; 
-    use matchbox_signaling::SignalingServer;
+    use futures::StreamExt;
+    use matchbox_protocol::{JsonPeerEvent, PeerId}; 
+    use matchbox_signaling::{SignalingServer, SignalingServerBuilder};
     use std::{net::Ipv4Addr, str::FromStr};
     use tokio::net::TcpStream;
     use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
     use tracing::info;
 
-    // Helper to take the next PeerEvent from a stream
+    use crate::{state::HybridState, topology::PEER_RATIO};
+
+    use super::HybridTopology;
+
+    /// Helper to build hybrid signaling server
+    fn app() -> SignalingServer {
+        let state = HybridState::default();
+        SignalingServerBuilder::new((Ipv4Addr::LOCALHOST, 0), HybridTopology, state.clone())
+            .on_connection_request(|connection| {
+                info!("Connecting: {connection:?}");
+                Ok(true) // Allow all connections
+            })
+            .on_id_assignment(|(socket, id)| info!("{socket} received {id}"))
+            .cors()
+            .trace()
+            .build()
+    }
+
+    /// Helper to take the next PeerEvent from a stream
     async fn recv_peer_event(
         client: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
     ) -> JsonPeerEvent {
@@ -162,7 +173,7 @@ mod tests {
         JsonPeerEvent::from_str(&message.to_string()).expect("json peer event")
     }
 
-    // Helper to extract PeerId when expecting an Id assignment
+    /// Helper to extract PeerId when expecting an Id assignment
     fn get_peer_id(peer_event: JsonPeerEvent) -> PeerId {
         if let JsonPeerEvent::IdAssigned(id) = peer_event {
             id
@@ -170,10 +181,10 @@ mod tests {
             panic!("Peer_event was not IdAssigned: {peer_event:?}");
         }
     }
-
+    /// Testing peer can connect to signaling server
     #[tokio::test]
     async fn ws_connect() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
+        let mut server = app();
         let addr = server.bind().unwrap();
         tokio::spawn(server.serve());
 
@@ -182,337 +193,222 @@ mod tests {
             .expect("handshake");
     }
 
-
-
+    /// Testing peer is assigned an id upon initial connection
     #[tokio::test]
     async fn uuid_assigned() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
+        let mut server = app();        
+        let addr = server.bind().unwrap();
+        tokio::spawn(server.serve());
+
+        let (mut peer, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+
+        let id_assigned_event = recv_peer_event(&mut peer).await;
+
+        assert!(matches!(id_assigned_event, JsonPeerEvent::IdAssigned(..)));
+    }
+
+    /// Testing a super peer can make up to PEER_RATIO connections with connecting child peers
+    #[tokio::test]
+    async fn super_peer_gets_peer_ratio_children() {
+        let mut server = app(); 
         let addr = server.bind().unwrap();
         tokio::spawn(server.serve());
 
         let (mut super_peer, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
             .await
             .unwrap();
+        let _super_peer_uuid = get_peer_id(recv_peer_event(&mut super_peer).await);
 
-        let id_assigned_event = recv_peer_event(&mut super_peer).await;
+        let mut child_peers: Vec<(PeerId, WebSocketStream<MaybeTlsStream<TcpStream>>)> = Vec::new();
 
-        assert!(matches!(id_assigned_event, JsonPeerEvent::IdAssigned(..)));
-    }
-
-    #[tokio::test]
-    async fn multiple_super_peers() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let _a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+        for _ in 0..PEER_RATIO {
+            let (mut child_peer,  _response) =  tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
                 .await
                 .unwrap();
-        let b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
+            let child_peer_uuid = get_peer_id(recv_peer_event(&mut child_peer).await);
 
-        let new_peer_event = recv_peer_event(&mut super_peer_a).await;
-
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
-    }
-
-    #[tokio::test]
-    async fn connect_child_peer() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
-
-        let new_peer_event = recv_peer_event(&mut super_peer_a).await;
-
-        info!("Super peer a got: {new_peer_event}");
-
-        let (mut child_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let child_a_uuid = get_peer_id(recv_peer_event(&mut child_a).await);
-
-        let new_peer_event: PeerEvent<serde_json::Value>;
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            new_peer_event = recv_peer_event(&mut super_peer_a).await;
-        }
-        else {
-            new_peer_event = recv_peer_event(&mut super_peer_b).await;
+            child_peers.push((child_peer_uuid, child_peer));
         }
 
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(child_a_uuid));
+            
+        let mut received_new_peers: Vec<PeerId> = Vec::new();
+        while received_new_peers.len() < PEER_RATIO {
+            let event = recv_peer_event(&mut super_peer).await;
 
-    
-        let (mut child_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let child_b_uuid = get_peer_id(recv_peer_event(&mut child_b).await);
-
-        let new_peer_event:PeerEvent<serde_json::Value>;
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            new_peer_event = recv_peer_event(&mut super_peer_b).await;
-        }
-        else {
-            new_peer_event = recv_peer_event(&mut super_peer_a).await;
-        }
-
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(child_b_uuid));
-
-    }
-
-    #[tokio::test]
-    async fn disconnect_child_peer() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
-
-        recv_peer_event(&mut super_peer_a).await;
-
-        let (mut child_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-        .await
-        .unwrap();
-        let child_a_uuid = get_peer_id(recv_peer_event(&mut child_a).await);
-
-        let new_peer_event: PeerEvent<serde_json::Value>;
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            new_peer_event = recv_peer_event(&mut super_peer_a).await;
-        }
-        else {
-            new_peer_event = recv_peer_event(&mut super_peer_b).await;
-        }
-
-        assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(child_a_uuid));
-
-        _ = child_a.close(None).await;
-        let peer_left_event: PeerEvent<serde_json::Value>;
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            peer_left_event = recv_peer_event(&mut super_peer_a).await;
-        }
-        else {
-            peer_left_event = recv_peer_event(&mut super_peer_b).await;
-        }
-
-        assert_eq!(peer_left_event, JsonPeerEvent::PeerLeft(child_a_uuid));
-
-    }
-
-   #[tokio::test]
-    async fn disconnect_super_peer_no_children() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let _super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
-
-        recv_peer_event(&mut super_peer_a).await;
-
-        _ = super_peer_a.close(None).await;
-        let peer_left_event = recv_peer_event(&mut super_peer_b).await;
-
-        assert_eq!(peer_left_event, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-
-    }
-
-    #[tokio::test]
-    async fn disconnect_super_peer_with_children() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
-
-        recv_peer_event(&mut super_peer_a).await;
-
-        let (mut child_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-        .await
-        .unwrap();
-        let child_a_uuid = get_peer_id(recv_peer_event(&mut child_a).await);
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            recv_peer_event(&mut super_peer_a).await;
-            _ = super_peer_a.close(None).await;
-            assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-            assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-            assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_a_uuid));
-
-        }
-        else {
-            recv_peer_event(&mut super_peer_b).await;
-            _ = super_peer_b.close(None).await;
-            assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-            assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-            assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_a_uuid));
-        }
-    }
-
-    #[tokio::test] 
-    async fn reassigning_children() {
-        let mut server = SignalingServer::hybrid_builder((Ipv4Addr::LOCALHOST, 0)).build();
-        let addr = server.bind().unwrap();
-        tokio::spawn(server.serve());
-
-        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
-
-        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-        let super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
-
-        recv_peer_event(&mut super_peer_a).await;
-
-        let (mut child_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-        .await
-        .unwrap();
-        let child_a_uuid = get_peer_id(recv_peer_event(&mut child_a).await);
-
-        if super_peer_a_uuid < super_peer_b_uuid {
-            assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_a_uuid));
-
-            let (mut child_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-            let child_b_uuid = get_peer_id(recv_peer_event(&mut child_b).await);
-            assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_b_uuid));
-
-            let (mut child_c, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-            let child_c_uuid = get_peer_id(recv_peer_event(&mut child_c).await);
-            assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_c_uuid));
-
-            _ = super_peer_a.close(None).await;
-
-            if child_a_uuid < child_c_uuid {
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_a_uuid));
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::NewPeer(child_c_uuid));
-            }
-            else{
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::PeerLeft(super_peer_a_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_c_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::NewPeer(child_a_uuid));
+            match event {
+                JsonPeerEvent::NewPeer(peer_id) => received_new_peers.push(peer_id),
+                _ => assert!(false),
             }
         }
-        else {
-            assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_a_uuid));
 
-            let (mut child_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-            let child_b_uuid = get_peer_id(recv_peer_event(&mut child_b).await);
-            assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_b_uuid));
+        let expected: std::collections::HashSet<_> = child_peers.into_iter().map(|(id, _)| id).collect();
+        let actual: std::collections::HashSet<_> = received_new_peers.into_iter().collect();
 
-            let (mut child_c, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
-            .await
-            .unwrap();
-            let child_c_uuid = get_peer_id(recv_peer_event(&mut child_c).await);
-            assert_eq!(recv_peer_event(&mut super_peer_b).await, JsonPeerEvent::NewPeer(child_c_uuid));
-
-            _ = super_peer_b.close(None).await;
-
-            if child_a_uuid < child_c_uuid {
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_a_uuid));
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::NewPeer(child_c_uuid));
-            }
-            else {
-                assert_eq!(recv_peer_event(&mut child_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::PeerLeft(super_peer_b_uuid));
-                assert_eq!(recv_peer_event(&mut super_peer_a).await, JsonPeerEvent::NewPeer(child_c_uuid));
-                assert_eq!(recv_peer_event(&mut child_c).await, JsonPeerEvent::NewPeer(child_a_uuid));
-            }  
-        }
+        assert_eq!(expected, actual, "Super peer did not receive all child's NewPeer events");
     }
+
+    /// Testing that upon the connection of a second super peer, existing children in the network are spread evenly
     #[tokio::test]
-    async fn signal() {
-        let mut server = SignalingServer::client_server_builder((Ipv4Addr::LOCALHOST, 0)).build();
+    async fn new_super_peer_then_rebalance() {
+        let mut server = app(); 
         let addr = server.bind().unwrap();
         tokio::spawn(server.serve());
 
-        let (mut host, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+        let (mut super_peer_a, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
             .await
             .unwrap();
-        let _host_uuid = get_peer_id(recv_peer_event(&mut host).await);
+        let _super_peer_a_uuid = get_peer_id(recv_peer_event(&mut super_peer_a).await);
 
-        let (mut client_a, _response) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+        let mut child_peers: Vec<WebSocketStream<MaybeTlsStream<TcpStream>>> = Vec::new();
+
+        for _ in 0..PEER_RATIO {
+            let (mut child_peer,  _response) =  tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
                 .await
                 .unwrap();
-        let a_uuid = get_peer_id(recv_peer_event(&mut client_a).await);
+            let _child_peer_uuid = get_peer_id(recv_peer_event(&mut child_peer).await);
 
-        let new_peer_event = recv_peer_event(&mut host).await;
-        let peer_uuid = match new_peer_event {
-            JsonPeerEvent::NewPeer(PeerId(peer_uuid)) => peer_uuid.to_string(),
-            _ => panic!("unexpected event"),
-        };
+            child_peers.push(child_peer);
+        }
 
-        _ = client_a
-            .send(Message::text(format!(
-                "{{\"Signal\": {{\"receiver\": \"{peer_uuid}\", \"data\": \"123\" }}}}"
-            )))
-            .await;
+            
+        let mut received_new_peers: Vec<PeerId> = Vec::new();
+        while received_new_peers.len() < PEER_RATIO {
+            let event = recv_peer_event(&mut super_peer_a).await;
 
-        let signal_event = recv_peer_event(&mut host).await;
-        assert_eq!(
-            signal_event,
-            JsonPeerEvent::Signal {
-                data: serde_json::Value::String("123".to_string()),
-                sender: a_uuid,
+            match event {
+                JsonPeerEvent::NewPeer(peer_id) => received_new_peers.push(peer_id),
+                _ => assert!(false),
+            } 
+        }
+
+        let (mut super_peer_b, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+        let super_peer_b_uuid = get_peer_id(recv_peer_event(&mut super_peer_b).await);
+
+        let mut former_children: Vec<PeerId> = Vec::new();
+        while former_children.len() < PEER_RATIO / 2 {
+            let event = recv_peer_event(&mut super_peer_a).await;
+
+            match event {
+                JsonPeerEvent::PeerLeft(peer_id) => former_children.push(peer_id),
+                JsonPeerEvent::NewPeer(_) => assert_eq!(event, JsonPeerEvent::NewPeer(super_peer_b_uuid)),
+                _ => assert!(false),
             }
-        );
+        }
+ 
+        let mut new_children: Vec<PeerId> = Vec::new();
+        while new_children.len() < PEER_RATIO / 2 {
+            let event = recv_peer_event(&mut super_peer_b).await;
+            match event {
+                JsonPeerEvent::NewPeer(peer_id) => new_children.push(peer_id),
+                _ => assert!(false),
+            }
+        }
+
+        let super_peer_a_left_children: std::collections::HashSet<_> = former_children.into_iter().collect();
+        let super_peer_b_joined_children: std::collections::HashSet<_> = new_children.into_iter().collect();
+
+        assert_eq!(super_peer_a_left_children, super_peer_b_joined_children, "Children were not transfered correctly");
+    }
+
+    /// Testing that a child can smoothly disconnect from the network
+    #[tokio::test]
+    async fn child_peer_disconnecting() {
+        let mut server = app(); 
+        let addr = server.bind().unwrap();
+        tokio::spawn(server.serve());
+
+        let (mut super_peer, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+        let _super_peer_uuid = get_peer_id(recv_peer_event(&mut super_peer).await);
+
+        let (mut child_peer,  _response) =  tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+        let child_peer_uuid = get_peer_id(recv_peer_event(&mut child_peer).await);
+
+        let event = recv_peer_event(&mut super_peer).await;
+
+        assert_eq!(event, JsonPeerEvent::NewPeer(child_peer_uuid));
+
+        let _ = child_peer.close(None).await;
+
+        let event = recv_peer_event(&mut super_peer).await;
+
+        assert_eq!(event, JsonPeerEvent::PeerLeft(child_peer_uuid));
+    }
+
+    /// Testing that a super peer can smoothly disconnect from the network and have one of its children be promoted to take its place
+    #[tokio::test]
+    async fn super_peer_disconnecting() {
+        let mut server = app(); 
+        let addr = server.bind().unwrap();
+        tokio::spawn(server.serve());
+
+        let (mut super_peer, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+            .await
+            .unwrap();
+        let super_peer_uuid = get_peer_id(recv_peer_event(&mut super_peer).await);
+
+        let mut child_peers: Vec<(PeerId, WebSocketStream<MaybeTlsStream<TcpStream>>)> = Vec::new();
+
+        for _ in 0..PEER_RATIO {
+            let (mut child_peer,  _response) =  tokio_tungstenite::connect_async(format!("ws://{addr}/room_a"))
+                .await
+                .unwrap();
+            let child_peer_uuid = get_peer_id(recv_peer_event(&mut child_peer).await);
+
+            child_peers.push((child_peer_uuid, child_peer));
+        }
+ 
+        for _ in 0..PEER_RATIO {
+            let event = recv_peer_event(&mut super_peer).await;
+
+            match event {
+                JsonPeerEvent::NewPeer(_) => {} ,
+                _ => assert!(false),
+            }
+        }
+
+        let _ = super_peer.close(None).await;
+
+        for i in 0..PEER_RATIO {
+            let event = recv_peer_event(&mut child_peers[i].1).await;
+
+            match event {
+                JsonPeerEvent::PeerLeft(id) => assert_eq!(id, super_peer_uuid) ,
+                _ => assert!(false),
+            }
+        }
+
+        let mut new_children: Vec<PeerId> = Vec::new();
+        let mut new_super_peer = child_peers[0].0;
+        let mut index = 0;
+        for i in 1..PEER_RATIO {
+            if child_peers[i].0 < new_super_peer{
+                new_super_peer = child_peers[i].0;
+                index = i;
+            }
+        }
+
+        let mut new_super_peer = child_peers.remove(index);
+        while new_children.len() < PEER_RATIO - 1 {
+            let event = recv_peer_event(&mut new_super_peer.1).await;
+
+            match event {
+                JsonPeerEvent::NewPeer(id) => new_children.push(id),
+                _ => assert!(false),
+            }
+        }
+
+        let expected: std::collections::HashSet<_> = child_peers.into_iter().map(|(id, _)| id).collect();
+        let actual: std::collections::HashSet<_> = new_children.into_iter().collect();
+
+        assert_eq!(expected, actual);
     }
 }
+
