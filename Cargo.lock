@@ -3490,6 +3490,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchbox_hybrid_client"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "futures 0.3.31",
+ "futures-timer",
+ "log",
+ "matchbox_socket",
+ "wasm-bindgen",
+ "wasm-bindgen-futures 0.4.49",
+ "web-sys",
+]
+
+[[package]]
 name = "matchbox_protocol"
 version = "0.11.0"
 dependencies = [
@@ -3503,6 +3518,28 @@ dependencies = [
 [[package]]
 name = "matchbox_server"
 version = "0.11.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "clap",
+ "futures 0.3.31",
+ "matchbox_protocol",
+ "matchbox_signaling",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.8",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "matchbox_server_hybrid"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
