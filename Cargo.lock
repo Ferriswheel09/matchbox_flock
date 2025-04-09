@@ -3633,6 +3633,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchbox_superer_client"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "futures 0.3.31",
+ "futures-timer",
+ "log",
+ "matchbox_socket",
+ "serde",
+ "serde-wasm-bindgen 0.4.5",
+ "serde_json",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures 0.4.49",
+]
+
+[[package]]
 name = "matchers"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

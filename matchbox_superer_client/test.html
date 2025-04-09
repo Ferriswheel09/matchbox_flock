@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Mesh Network Tester</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1, h2 {
+            color: #333;
+        }
+        .control-panel {
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+        }
+        input, button {
+            padding: 8px 12px;
+            margin: 5px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        input {
+            width: 300px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .network-view {
+            display: flex;
+            gap: 20px;
+        }
+        .peer-info, .log-panel {
+            flex: 1;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 15px;
+            min-height: 300px;
+        }
+        .peer-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        .peer-item {
+            padding: 10px;
+            margin-bottom: 5px;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+            border-left: 4px solid #4CAF50;
+        }
+        .log-panel {
+            background-color: #2d2d2d;
+            color: #f0f0f0;
+            font-family: monospace;
+            overflow-y: auto;
+            padding: 10px;
+        }
+        .log-entry {
+            margin: 3px 0;
+            padding: 3px 0;
+            border-bottom: 1px solid #444;
+        }
+        .timestamp {
+            color: #999;
+            font-size: 0.8em;
+            margin-right: 5px;
+        }
+        .info {
+            color: #8cdcfe;
+        }
+        .error {
+            color: #f48771;
+        }
+        .warning {
+            color: #dcdcaa;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background-color: #e8f5e9;
+            border-left: 4px solid #4CAF50;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebRTC Mesh Network Tester</h1>
+        
+        <div class="control-panel">
+            <h2>Client Controls</h2>
+            <div>
+                <input type="text" id="clientInfo" placeholder="Enter client info (e.g., name, role, etc.)" value="Client-1">
+                <button id="initClient">Initialize Client</button>
+                <button id="startClient" disabled>Start Client</button>
+            </div>
+            <div class="status" id="statusMessage">Status: Waiting for initialization</div>
+        </div>
+        
+        <div class="network-view">
+            <div class="peer-info">
+                <h2>Connected Peers</h2>
+                <div id="peersCount">No peers connected</div>
+                <ul class="peer-list" id="peersList">
+                    <!-- Peer information will be displayed here -->
+                </ul>
+            </div>
+            
+            <div class="log-panel" id="logPanel">
+                <!-- Logs will be appended here -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Main application code
+        const app = {
+            client: null,
+            initialized: false,
+            started: false,
+            peerCheckInterval: null,
+            
+            log(message, type = 'info') {
+                const logPanel = document.getElementById('logPanel');
+                const entry = document.createElement('div');
+                entry.className = `log-entry ${type}`;
+                
+                const timestamp = document.createElement('span');
+                timestamp.className = 'timestamp';
+                timestamp.textContent = new Date().toLocaleTimeString();
+                
+                entry.appendChild(timestamp);
+                entry.appendChild(document.createTextNode(message));
+                
+                logPanel.appendChild(entry);
+                logPanel.scrollTop = logPanel.scrollHeight;
+            },
+            
+            updateStatus(message) {
+                const statusElement = document.getElementById('statusMessage');
+                statusElement.textContent = `Status: ${message}`;
+            },
+            
+            async initializeClient() {
+                if (this.initialized) {
+                    this.log('Client already initialized', 'warning');
+                    return;
+                }
+                
+                try {
+                    this.log('Loading WASM module...');
+                    
+                    // Assuming your WASM module is built and available
+                    // Change the path to your actual WASM module path
+                    const module = await import('./pkg/matchbox_superer_client.js');
+                    await module.default();
+                    this.log('WASM module loaded successfully');
+                    
+                    // Create new client instance
+                    this.client = new module.Client();
+                    this.initialized = true;
+                    
+                    // Enable start button
+                    document.getElementById('startClient').disabled = false;
+                    document.getElementById('initClient').disabled = true;
+                    
+                    // Set client info
+                    const clientInfo = document.getElementById('clientInfo').value || 'Client-1';
+                    this.client.setInfo(clientInfo);
+                    
+                    this.updateStatus('Client initialized. Ready to start.');
+                    this.log(`Client initialized with info: ${clientInfo}`);
+                    
+                } catch (error) {
+                    this.log(`Failed to initialize client: ${error.message}`, 'error');
+                    this.updateStatus('Initialization failed. See logs.');
+                    console.error('Initialization error:', error);
+                }
+            },
+            
+            startClient() {
+                if (!this.initialized) {
+                    this.log('Cannot start client: Client not initialized', 'error');
+                    return;
+                }
+                
+                if (this.started) {
+                    this.log('Client already started', 'warning');
+                    return;
+                }
+                
+                try {
+                    this.log('Starting WebRTC client...');
+                    this.client.start();
+                    this.started = true;
+                    
+                    // Disable start button, client can only be started once
+                    document.getElementById('startClient').disabled = true;
+                    
+                    this.updateStatus('Client started. Connecting to peers...');
+                    
+                    // Start periodic peer check
+                    this.startPeerCheck();
+                    
+                } catch (error) {
+                    this.log(`Failed to start client: ${error.message}`, 'error');
+                    this.updateStatus('Start failed. See logs.');
+                    console.error('Start error:', error);
+                }
+            },
+            
+            startPeerCheck() {
+                // Check for peers every second
+                this.peerCheckInterval = setInterval(() => {
+                    if (this.client && this.started) {
+                        this.updatePeerInfo();
+                    }
+                }, 1000);
+            },
+            
+            updatePeerInfo() {
+                try {
+                    const peerInfoMap = this.client.getAllInfo();
+                    const peersList = document.getElementById('peersList');
+                    const peersCount = document.getElementById('peersCount');
+                    
+                    // Clear current list
+                    peersList.innerHTML = '';
+                    
+                    // Convert map to array for easier manipulation
+                    const peers = [];
+                    peerInfoMap.forEach((info, id) => {
+                        peers.push({ id, info });
+                    });
+                    
+                    if (peers.length === 0) {
+                        peersCount.textContent = 'No peers connected';
+                    } else {
+                        peersCount.textContent = `Connected peers: ${peers.length}`;
+                        
+                        // Create peer list items
+                        peers.forEach(peer => {
+                            const item = document.createElement('li');
+                            item.className = 'peer-item';
+                            item.textContent = `ID: ${peer.id} - Info: ${peer.info}`;
+                            peersList.appendChild(item);
+                        });
+                    }
+                } catch (error) {
+                    this.log(`Error updating peer info: ${error.message}`, 'error');
+                    console.error('Peer info error:', error);
+                }
+            }
+        };
+        
+        // Set up event listeners when DOM is loaded
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('initClient').addEventListener('click', () => {
+                app.initializeClient();
+            });
+            
+            document.getElementById('startClient').addEventListener('click', () => {
+                app.startClient();
+            });
+            
+            // Log initial message
+            app.log('WebRTC Mesh Network Tester loaded');
+            console.log('WebRTC Mesh Network Tester initialized');
+        });
+
+        // Override console.log to also display in our log panel
+        const originalConsoleLog = console.log;
+        console.log = function() {
+            // Call original console.log
+            originalConsoleLog.apply(console, arguments);
+            
+            // Format arguments into a string
+            const message = Array.from(arguments)
+                .map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg)
+                .join(' ');
+                
+            // Add to our log panel
+            app.log(message);
+        };
+        
+        // Capture and log errors globally
+        window.addEventListener('error', function(event) {
+            app.log(`Global error: ${event.message} at ${event.filename}:${event.lineno}`, 'error');
+        });
+    </script>
+</body>
+</html>

@@ -14,6 +14,7 @@ use futures::{
 use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
 use log::{debug, error};
 use matchbox_protocol::PeerId;
+use once_cell::race::OnceBox;
 use std::{collections::HashMap, future::ready, pin::Pin, task::Poll, time::Duration};
 use tokio_util::{
     compat::TokioAsyncWriteCompatExt,
@@ -210,9 +211,13 @@ impl WebRtcSocketBuilder {
         }
 
         let (id_tx, id_rx) = futures_channel::oneshot::channel();
+        let (super_peer_tx, super_peer_rx) = futures_channel::oneshot::channel();
+        let (parent_tx, parent_rx) = futures_channel::oneshot::channel();
 
         let socket_fut = run_socket(
             id_tx,
+            super_peer_tx,
+            parent_tx,
             self.config,
             peer_messages_out_rx,
             peer_state_tx,
@@ -233,7 +238,11 @@ impl WebRtcSocketBuilder {
         (
             WebRtcSocket {
                 id: Default::default(),
+                super_peer: Default::default(),
+                parent: Default::default(),
                 id_rx,
+                super_peer_rx,
+                parent_rx,
                 peer_state_rx,
                 peers: Default::default(),
                 channels,
@@ -260,6 +269,10 @@ pub enum PeerState {
     /// - Some of the the data channels got disconnected/closed
     /// - The peer left the signaling server
     Disconnected,
+
+
+    // Attempting to add connections based on super peers connecting and disconnecting
+    // Will require configuration of the entire network
 }
 /// Used to send and receive packets on a given WebRTC channel. Must be created as part of a
 /// [`WebRtcSocket`].
@@ -435,7 +448,11 @@ where
 #[derive(Debug)]
 pub struct WebRtcSocket {
     id: once_cell::race::OnceBox<PeerId>,
+    super_peer: once_cell::race::OnceBox<bool>,
+    parent: once_cell::race::OnceBox<PeerId>,
     id_rx: futures_channel::oneshot::Receiver<PeerId>,
+    super_peer_rx: futures_channel::oneshot::Receiver<bool>,
+    parent_rx: futures_channel::oneshot::Receiver<PeerId>,
     peer_state_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, PeerState)>,
     peers: HashMap<PeerId, PeerState>,
     channels: Vec<Option<WebRtcChannel>>,
@@ -569,6 +586,33 @@ impl WebRtcSocket {
             Some(*id)
         } else if let Ok(Some(id)) = self.id_rx.try_recv() {
             let id = self.id.get_or_init(|| id.into());
+            Some(*id)
+        } else {
+            None
+        }
+    }
+
+    /// Returns whether this peer is a super peer or not
+    /// Generally only super peers will have their status updated, so should be pretty simple
+    pub fn super_peer(&mut self) -> Option<bool> {
+        if let Some(super_peer) = self.super_peer.get() {
+            Some(*super_peer)
+        } else if let Ok(Some(super_peer)) = self.super_peer_rx.try_recv() {
+            let id = self.super_peer.get_or_init(|| super_peer.into());
+            Some(*id)
+        } else {
+            None
+        }
+    }
+
+    /// If this occurred, then two things are true
+    /// 1. the peer is a child peer, thus making super peer false
+    /// 2. the parent exists
+    pub fn parent_peer(&mut self) -> Option<PeerId> {
+        if let Some(super_peer) = self.parent.get() {
+            Some(*super_peer)
+        } else if let Ok(Some(super_peer)) = self.parent_rx.try_recv() {
+            let id = self.parent.get_or_init(|| super_peer.into());
             Some(*id)
         } else {
             None
@@ -766,6 +810,8 @@ pub struct MessageLoopChannels {
 
 async fn run_socket(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
+    super_peer_tx: futures_channel::oneshot::Sender<bool>,
+    parent_tx: futures_channel::oneshot::Sender<PeerId>,
     config: SocketConfig,
     peer_messages_out_rx: Vec<futures_channel::mpsc::UnboundedReceiver<(PeerId, Packet)>>,
     peer_state_tx: futures_channel::mpsc::UnboundedSender<(PeerId, PeerState)>,
@@ -792,6 +838,8 @@ async fn run_socket(
     };
     let message_loop_fut = message_loop::<UseMessenger>(
         id_tx,
+        super_peer_tx,
+        parent_tx,
         &config.ice_server,
         &config.channels,
         channels,

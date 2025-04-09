@@ -50,10 +50,24 @@ async fn async_main() {
     let loop_fut = loop_fut.fuse();
     futures::pin_mut!(loop_fut);
 
+    let mut flag = false;
+
     let timeout = Delay::new(Duration::from_millis(100));
     futures::pin_mut!(timeout);
 
     loop {
+        if !flag{
+            if !socket.super_peer().is_none(){
+                info!("Socket created, super peer: {:?}", socket.super_peer().unwrap());
+                flag = true;
+            }
+            else if !socket.parent_peer().is_none(){
+                info!("Socket created, parent peer: {:?}", socket.parent_peer().unwrap());
+                flag = true;
+            }
+        }
+        
+
         // Handle any new peers
         for (peer, state) in socket.update_peers() {
             match state {
