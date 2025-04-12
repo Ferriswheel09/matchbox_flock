@@ -72,6 +72,29 @@ impl HybridState {
         }
     }
 
+    pub fn promote_child_to_super(&mut self, peer_id: PeerId) {
+        let mut peers = self.peers.lock().unwrap();
+
+        if let Some(peer) = peers.get_mut(&peer_id) {
+            // Notify the peer of their promotion
+            let event = Message::Text(JsonPeerEvent::SuperIdAssigned(peer_id).to_string());
+            if let Err(e) = try_send(&peer.signaling_channel, event.clone()) {
+                error!("failed to notify promoted super peer {peer_id}: {e:?}");
+            } else {
+                info!("notified {peer_id} of promotion to super peer");
+            }
+
+            // Notify other super peers
+            for (other_id, other_peer) in peers.iter() {
+                if *other_id != peer_id && other_peer.is_super() {
+                    let _ = self.try_send_to_peer(*other_id, event.clone());
+                }
+            }
+        } else {
+            error!("Cannot promote {peer_id} because they do not exist");
+        }
+    }
+
     /// Get all super peer IDs
     pub fn get_super_peer_ids(&self) -> Vec<PeerId> {
         self.peers
@@ -119,7 +142,7 @@ impl HybridState {
 
     /// Add a new super peer
     pub fn add_super_peer(&mut self, peer: PeerId, sender: SignalingChannel) {
-        let event = Message::Text(JsonPeerEvent::NewPeer(peer).to_string());
+        let event = Message::Text(JsonPeerEvent::SuperIdAssigned(peer).to_string());
         let super_peers = { self.get_super_peer_ids() };
 
         // Notify the new super peer itself
@@ -305,7 +328,8 @@ impl HybridState {
             // Turn `recruit_id` into a super peer in place, then re‐attach the other children to it.
             // We do so in a new scope, so the lock is short‐lived.
             {
-                let mut peers_map = self.peers.lock().unwrap();
+                let mut peers_map: std::sync::MutexGuard<'_, HashMap<PeerId, Peer>> =
+                    self.peers.lock().unwrap();
 
                 // If the recruit still exists in the map, update it.
                 if let Some(recruit) = peers_map.get_mut(&recruit_id) {
@@ -328,6 +352,7 @@ impl HybridState {
             } // lock dropped
 
             info!("Promoted peer {recruit_id} to super peer");
+            self.promote_child_to_super(recruit_id);
 
             // Re‐attach the other children to the new super peer
             for &child_id in &former_children {

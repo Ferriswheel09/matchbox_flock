@@ -73,14 +73,11 @@ impl Client {
     pub fn getAllInfo(&self) -> js_sys::Map {
         let result = js_sys::Map::new();
         for (peer_id, info) in self.peer_info.borrow().iter() {
-            info!("Peer: {} => {}", peer_id, info);
             let peer_id_str = peer_id.to_string();
             let peer_id_js = wasm_bindgen::JsValue::from_str(&peer_id_str);
             let info_js = wasm_bindgen::JsValue::from_str(info);
             result.set(&peer_id_js, &info_js);
         }
-        // Log the size of the map
-        info!("Peer info map size: {}", self.peer_info.borrow().len());
         result
     }
 
@@ -227,6 +224,9 @@ impl Client {
                             child_peers_rc.borrow_mut().remove(&peer);
                             handshake_states_rc.borrow_mut().remove(&peer);
                             peer_info_rc.borrow_mut().remove(&peer);
+                            if Some(peer) == parent_id {
+                                initialized = false;
+                            }
                         }
                     }
                 }
@@ -286,10 +286,6 @@ impl Client {
                             let actual_info = parts[2].to_string();
                             if let Ok(sender_uuid) = Uuid::parse_str(sender_id_str) {
                                 let sender_id = PeerId(sender_uuid);
-                                info!(
-                                    "Received info originally from {}: {}",
-                                    sender_id, actual_info
-                                );
                                 peer_info_rc.borrow_mut().insert(sender_id, actual_info);
 
                                 if let Some(PeerRole::Super) = self_role {
@@ -298,7 +294,6 @@ impl Client {
                                             socket
                                                 .channel_mut(CHANNEL_ID)
                                                 .send(packet.clone(), *child_peer);
-                                            info!("Forwarded info to child peer: {}", child_peer);
                                         }
                                     }
                                     for super_peer in super_peers_rc.borrow().keys() {
@@ -306,7 +301,6 @@ impl Client {
                                             socket
                                                 .channel_mut(CHANNEL_ID)
                                                 .send(packet.clone(), *super_peer);
-                                            info!("Forwarded info to super peer: {}", super_peer);
                                         }
                                     }
                                 }
@@ -339,20 +333,24 @@ impl Client {
                             socket.channel_mut(CHANNEL_ID).send(packet, peer);
                         }
                     } else if message == "super_handshake_ack" {
-                        if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
-                            if let Some(state) = states.get_mut(&peer) {
-                                state.acknowledged = true;
-                                info!("Super peer handshake acknowledged by {}", peer);
-                                if let Some(my_peer_id) = socket.id() {
-                                    let info_msg =
-                                        format!("info|{}|{}", my_peer_id, info_rc.borrow());
-                                    let packet = info_msg.as_bytes().to_vec().into_boxed_slice();
-                                    socket.channel_mut(CHANNEL_ID).send(packet, peer);
-                                    info!("Sent info after super peer handshake ack: {}", info_msg);
+                        if let Some(PeerRole::Super) = self_role {
+                            if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
+                                if let Some(state) = states.get_mut(&peer) {
+                                    state.acknowledged = true;
+                                    info!("Super peer handshake acknowledged by {}", peer);
+                                    if let Some(my_peer_id) = socket.id() {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                                        info!(
+                                            "Sent info after super peer handshake ack: {}",
+                                            info_msg
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        if let Some(PeerRole::Super) = self_role {
                             super_peers_rc
                                 .borrow_mut()
                                 .insert(peer, "OtherSuperPeer".to_string());
@@ -383,7 +381,6 @@ impl Client {
                             }
                         }
                     } else {
-                        info!("Received other message from {}: {}", peer, message);
                         if let Some(PeerRole::Super) = self_role {
                             if child_peers_rc.borrow().contains_key(&peer) {
                                 for child_peer in child_peers_rc.borrow().keys() {
@@ -391,7 +388,6 @@ impl Client {
                                         socket
                                             .channel_mut(CHANNEL_ID)
                                             .send(packet.clone(), *child_peer);
-                                        info!("Forwarded message to child peer: {}", child_peer);
                                     }
                                 }
                                 for super_peer in super_peers_rc.borrow().keys() {
@@ -399,7 +395,6 @@ impl Client {
                                         socket
                                             .channel_mut(CHANNEL_ID)
                                             .send(packet.clone(), *super_peer);
-                                        info!("Forwarded message to super peer: {}", super_peer);
                                     }
                                 }
                             } else if super_peers_rc.borrow().contains_key(&peer) {
@@ -407,10 +402,6 @@ impl Client {
                                     socket
                                         .channel_mut(CHANNEL_ID)
                                         .send(packet.clone(), *child_peer);
-                                    info!(
-                                        "Forwarded message from super peer to child: {}",
-                                        child_peer
-                                    );
                                 }
                             }
                         }
