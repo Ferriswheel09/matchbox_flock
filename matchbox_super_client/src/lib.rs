@@ -155,7 +155,17 @@ impl Client {
         let handshake_states_rc = self.peer_handshake_states.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://localhost:3536/")
+            let turn_server = matchbox_socket::RtcIceServerConfig {
+                urls: vec![
+                    "stun:34.229.159.62:3478".to_string(), 
+                    "turn:34.229.159.62:3478".to_string()
+                ],
+                username: Some("youruser".to_string()),
+                credential: Some("yourpassword".to_string()),
+            };
+
+            let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://34.229.159.62:3536/")
+                .ice_server(turn_server)
                 .add_reliable_channel()
                 .reconnect_attempts(Some(5))
                 .build();
