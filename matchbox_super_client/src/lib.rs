@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
+use js_sys::Date;
 use uuid::Uuid;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::JsValue;
@@ -36,6 +37,7 @@ pub struct Client {
     super_peers: Rc<RefCell<HashMap<PeerId, String>>>, // Map peer id to any additional info
     child_peers: Rc<RefCell<HashMap<PeerId, String>>>,
     peer_handshake_states: Rc<RefCell<HashMap<PeerId, HandshakeState>>>,
+    last_seen: Rc<RefCell<HashMap<PeerId, f64>>>,
 }
 
 #[wasm_bindgen]
@@ -48,6 +50,7 @@ impl Client {
             super_peers: Rc::new(RefCell::new(HashMap::new())),
             child_peers: Rc::new(RefCell::new(HashMap::new())),
             peer_handshake_states: Rc::new(RefCell::new(HashMap::new())),
+            last_seen: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -153,12 +156,13 @@ impl Client {
         let super_peers_rc = self.super_peers.clone();
         let child_peers_rc = self.child_peers.clone();
         let handshake_states_rc = self.peer_handshake_states.clone();
+        let last_seen_rc = self.last_seen.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let turn_server = matchbox_socket::RtcIceServerConfig {
                 urls: vec![
-                    "stun:34.229.159.62:3478".to_string(), 
-                    "turn:34.229.159.62:3478".to_string()
+                    "stun:34.229.159.62:3478".to_string(),
+                    "turn:34.229.159.62:3478".to_string(),
                 ],
                 username: Some("youruser".to_string()),
                 credential: Some("yourpassword".to_string()),
@@ -297,6 +301,7 @@ impl Client {
                             if let Ok(sender_uuid) = Uuid::parse_str(sender_id_str) {
                                 let sender_id = PeerId(sender_uuid);
                                 peer_info_rc.borrow_mut().insert(sender_id, actual_info);
+                                last_seen_rc.borrow_mut().insert(sender_id, Date::now());
 
                                 if let Some(PeerRole::Super) = self_role {
                                     for child_peer in child_peers_rc.borrow().keys() {
@@ -451,6 +456,22 @@ impl Client {
                                 },
                                 None => {}
                             }
+                        }
+                        let now = Date::now();
+                        let mut to_remove = vec![];
+
+                        for (peer_id, last_seen_time) in last_seen_rc.borrow().iter() {
+                            if now - *last_seen_time > 5000.0 {
+                                to_remove.push(*peer_id);
+                            }
+                        }
+
+                        for peer_id in to_remove {
+                            super_peers_rc.borrow_mut().remove(&peer_id);
+                            child_peers_rc.borrow_mut().remove(&peer_id);
+                            peer_info_rc.borrow_mut().remove(&peer_id);
+                            handshake_states_rc.borrow_mut().remove(&peer_id);
+                            last_seen_rc.borrow_mut().remove(&peer_id);
                         }
                     }
                     _ = &mut loop_fut => {
