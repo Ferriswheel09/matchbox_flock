@@ -51,6 +51,7 @@ impl SignalingTopology<NoCallbacks, HybridState> for HybridTopology{
                 match state.connect_child(peer_id, parent) {
                     Ok(_) => {
                         info!("Connected CHILD:{peer_id} to PARENT:{parent}");
+                        state.connect_child_parent(peer_id, parent, sender.clone());
                     }
                     Err(e) => {
                         error!("error sending peer {peer_id} to super: {e:?}");

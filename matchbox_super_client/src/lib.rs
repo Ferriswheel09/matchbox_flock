@@ -1,402 +1,480 @@
 use futures::{select, FutureExt};
 use futures_timer::Delay;
 use log::info;
-use matchbox_socket::{
-    Packet, PeerId, PeerState, RtcIceServerConfig, WebRtcSocket, WebRtcSocketBuilder,
-};
+use matchbox_socket::{PeerId, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
+use js_sys::Date;
 use uuid::Uuid;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::prelude::wasm_bindgen;
+use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::js_sys;
 
-#[derive(Serialize, Deserialize)]
-struct Position {
-    peer_id: Option<String>,
-    x: i32,
-    y: i32,
-    x_velocity: i32,
-    y_velocity: i32,
+const CHANNEL_ID: usize = 0;
+const HANDSHAKE_RETRY_INTERVAL_MS: u64 = 1000; // Retry every 1 second
+const MAX_HANDSHAKE_ATTEMPTS: u8 = 5; // Maximum retry attempts
+
+#[derive(Debug, Serialize, Deserialize)]
+enum PeerRole {
+    Super,
+    Child,
 }
 
 #[derive(Serialize, Deserialize)]
-enum Message {
-    PositionUpdate(Position),
-    PeerList(Vec<String>),
-    SuperPeer(String),
-    ChildPeer(String),
+struct HandshakeState {
+    attempts: u8,
+    acknowledged: bool,
 }
 
 #[wasm_bindgen]
 pub struct Client {
-    // Identity
-    peer_id: Option<PeerId>,
-    is_super: Option<bool>,
-
-    // Positioning
-    position: Rc<RefCell<Position>>,
-    peer_positions: Rc<RefCell<HashMap<PeerId, (i32, i32, i32, i32)>>>,
-
-    // Hash map
-    // Networking
-    known_super_peers: Rc<RefCell<Vec<PeerId>>>, // Super-peers track other super-peers
-    known_children_peers: Rc<RefCell<Vec<PeerId>>>, // Super-peers track their children
-    parent_peer: Option<PeerId>, // Each client has a designated super-peer if they are a regular peer
-    connected_peers: Rc<RefCell<Vec<PeerId>>>,
+    // All fields are now wrapped in Rc<RefCell<...>>.
+    info: Rc<RefCell<String>>,
+    peer_info: Rc<RefCell<HashMap<PeerId, String>>>,
+    super_peers: Rc<RefCell<HashMap<PeerId, String>>>, // Map peer id to any additional info
+    child_peers: Rc<RefCell<HashMap<PeerId, String>>>,
+    peer_handshake_states: Rc<RefCell<HashMap<PeerId, HandshakeState>>>,
+    last_seen: Rc<RefCell<HashMap<PeerId, f64>>>,
 }
 
 #[wasm_bindgen]
 impl Client {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Client {
-        Client {
-            peer_id: None,
-            is_super: None,
-            parent_peer: None,
-            connected_peers: Rc::new(RefCell::new(Vec::new())),
-            known_super_peers: Rc::new(RefCell::new(Vec::new())),
-            known_children_peers: Rc::new(RefCell::new(Vec::new())),
-            peer_positions: Rc::new(RefCell::new(HashMap::new())),
-            position: Rc::new(RefCell::new(Position {
-                peer_id: None,
-                x: 10,
-                y: 20,
-                x_velocity: 0,
-                y_velocity: 0,
-            })),
+    pub fn new() -> Self {
+        Self {
+            info: Rc::new(RefCell::new(String::new())),
+            peer_info: Rc::new(RefCell::new(HashMap::new())),
+            super_peers: Rc::new(RefCell::new(HashMap::new())),
+            child_peers: Rc::new(RefCell::new(HashMap::new())),
+            peer_handshake_states: Rc::new(RefCell::new(HashMap::new())),
+            last_seen: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
-    // The below section will be adding all the methods from our original library
-    // Will try to keep it as similar as possible to avoid rewriting API code in frontend
-
-    // update_id: Update the current clients ID
     #[wasm_bindgen]
-    pub fn update_id(&mut self, new_id: String) {
-        match uuid::Uuid::parse_str(&new_id) {
-            Ok(uuid) => {
-                self.peer_id = Some(PeerId(uuid));
-            }
-            Err(err) => {
-                eprintln!("Failed to parse UUID: {}", err);
-            }
+    pub fn set_info(&mut self, info: String) {
+        // Update the RefCell content for info
+        *self.info.borrow_mut() = info;
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn info(&self) -> String {
+        self.info.borrow().clone()
+    }
+
+    #[wasm_bindgen]
+    pub fn add_peer_info(&mut self, peer_id: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer_id).expect("Not a valid Peer ID");
+        let peer_id = PeerId(peer_uuid);
+        self.peer_info.borrow_mut().insert(peer_id, info.clone());
+    }
+
+    #[wasm_bindgen]
+    pub fn getAllInfo(&self) -> js_sys::Map {
+        let result = js_sys::Map::new();
+        for (peer_id, info) in self.peer_info.borrow().iter() {
+            let peer_id_str = peer_id.to_string();
+            let peer_id_js = wasm_bindgen::JsValue::from_str(&peer_id_str);
+            let info_js = wasm_bindgen::JsValue::from_str(info);
+            result.set(&peer_id_js, &info_js);
         }
+        result
     }
 
-    // update_position: Update the current clients Position
     #[wasm_bindgen]
-    pub fn update_position(&mut self, x: i32, y: i32, x_velocity: i32, y_velocity: i32) {
-        let mut position = self.position.borrow_mut();
-        position.x = x;
-        position.y = y;
-        position.x_velocity = x_velocity;
-        position.y_velocity = y_velocity;
+    pub fn add_super_peer(&mut self, peer: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+        self.super_peers.borrow_mut().insert(peer_id, info.clone());
     }
 
-    // get_position_velocity: Return the position and velocity of the current client as a string
-    #[wasm_bindgen(getter)]
-    pub fn get_position_velocity(&self) -> String {
-        match &self.peer_id {
-            Some(id) => format!(
-                "Player {} is at position: X={}, Y={}, X Velocity={}, Y Velocity={}",
-                id,
-                self.position.borrow().x,
-                self.position.borrow().y,
-                self.position.borrow().x_velocity,
-                self.position.borrow().y_velocity
-            ),
-            _ => "Error getting Position Velocity".to_string(),
-        }
-    }
-
-    // Below are helper methods for the getters of the different position values
-    #[wasm_bindgen(getter)]
-    pub fn x(&self) -> i32 {
-        self.position.borrow().x
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn y(&self) -> i32 {
-        self.position.borrow().y
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn x_velocity(&self) -> i32 {
-        self.position.borrow().x_velocity
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn y_velocity(&self) -> i32 {
-        self.position.borrow().y_velocity
-    }
-
-    // get_all_positions: Returns the list of all peers and all of their positions
-    // Necessary in order to get current state of all players (as well as if any dropped)
     #[wasm_bindgen]
-    pub fn get_all_positions(&self) -> JsValue {
-        let peer_positions = self.peer_positions.borrow();
-        let positions: Vec<Position> = peer_positions
+    pub fn add_child_peer(&mut self, peer: String, info: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+        self.child_peers.borrow_mut().insert(peer_id, info.clone());
+    }
+
+    #[wasm_bindgen]
+    pub fn remove_peer(&mut self, peer: String) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+
+        self.super_peers.borrow_mut().remove(&peer_id);
+        self.child_peers.borrow_mut().remove(&peer_id);
+        self.peer_handshake_states.borrow_mut().remove(&peer_id);
+        self.peer_info.borrow_mut().remove(&peer_id);
+    }
+
+    // Get peers to retry the handshake (peers with less than MAX_HANDSHAKE_ATTEMPTS and not acknowledged)
+    #[wasm_bindgen]
+    pub fn get_peers_to_retry(&self) -> Vec<String> {
+        self.peer_handshake_states
+            .borrow()
             .iter()
-            .map(|(peer_id, &(x, y, x_velocity, y_velocity))| Position {
-                peer_id: Some(peer_id.to_string()),
-                x,
-                y,
-                x_velocity,
-                y_velocity,
-            })
-            .collect();
-
-        JsValue::from_serde(&positions).unwrap_or(JsValue::from_str("[]"))
+            .filter(|(_, state)| state.attempts < MAX_HANDSHAKE_ATTEMPTS && !state.acknowledged)
+            .map(|(peer_id, _)| peer_id.to_string())
+            .collect()
     }
 
-    /// Gets the client's current peer ID as a string.
-    #[wasm_bindgen(getter)]
-    pub fn peer_id_string(&self) -> String {
-        match &self.peer_id {
-            Some(id) => id.0.to_string(),
-            None => "Not set".to_string(),
+    // Modified helper to take the handshake state map from self.
+    fn send_handshake(
+        socket: &mut WebRtcSocket,
+        handshake_states: &Rc<RefCell<HashMap<PeerId, HandshakeState>>>,
+        peer: String,
+        handshake_msg: &str,
+    ) {
+        let peer_uuid = Uuid::parse_str(&peer).expect("Invalid UUID format");
+        let peer_id = PeerId(peer_uuid);
+
+        if let Some(state) = handshake_states.borrow_mut().get_mut(&peer_id) {
+            info!(
+                "Sending handshake to {}: {} (attempt {})",
+                peer,
+                handshake_msg,
+                state.attempts + 1
+            );
+            let packet = handshake_msg.as_bytes().to_vec().into_boxed_slice();
+            socket.channel_mut(CHANNEL_ID).send(packet, peer_id);
+            state.attempts += 1;
         }
     }
 
-    /// Gets the number of connected peers.
-    #[wasm_bindgen(getter)]
-    pub fn connected_peer_count(&self) -> usize {
-        self.connected_peers.borrow().len()
-    }
-
-    // Start method for the server
     #[wasm_bindgen]
-    pub fn start(&mut self) -> Result<(), JsValue> {
+    pub fn start(&mut self) -> Result<(), wasm_bindgen::JsValue> {
         console_error_panic_hook::set_once();
         console_log::init_with_level(log::Level::Debug).unwrap();
 
-        info!("Starting P2P client...");
+        info!("Connecting to matchbox");
 
-        // Create references to the struct's fields
-        let position_ref = self.position.clone();
-        let connected_peers_ref = self.connected_peers.clone();
-        let peer_positions_ref = self.peer_positions.clone();
-        let known_super_peers_ref = self.known_super_peers.clone();
-        let known_children_peers_ref = self.known_children_peers.clone();
-        let peer_id_ref = Rc::new(RefCell::new(self.peer_id.clone()));
-        let parent_peer_ref = Rc::new(RefCell::new(self.parent_peer.clone()));
-        let is_super_ref = Rc::new(RefCell::new(self.is_super.clone()));
+        // Clone self’s inner Rc values to use within the async block.
+        let info_rc = self.info.clone();
+        let peer_info_rc = self.peer_info.clone();
+        let super_peers_rc = self.super_peers.clone();
+        let child_peers_rc = self.child_peers.clone();
+        let handshake_states_rc = self.peer_handshake_states.clone();
+        let last_seen_rc = self.last_seen.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            let url = "ws://localhost:3536".to_string();
-            let (mut socket, loop_fut) = WebRtcSocketBuilder::new(&url)
-                .add_unreliable_channel()
+            let turn_server = matchbox_socket::RtcIceServerConfig {
+                urls: vec![
+                    "stun:34.229.159.62:3478".to_string(),
+                    "turn:34.229.159.62:3478".to_string(),
+                ],
+                username: Some("youruser".to_string()),
+                credential: Some("yourpassword".to_string()),
+            };
+
+            let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://34.229.159.62:3536/")
+                .ice_server(turn_server)
+                .add_reliable_channel()
+                .reconnect_attempts(Some(5))
                 .build();
 
-            let loop_fut = loop_fut.fuse();
+            let mut loop_fut = loop_fut.fuse();
             futures::pin_mut!(loop_fut);
-            let timeout = Delay::new(Duration::from_millis(100));
+
+            let mut initialized = false;
+            let mut parent_id: Option<PeerId> = None;
+            let mut self_role: Option<PeerRole> = None;
+
+            let mut timeout = Delay::new(Duration::from_millis(100));
             futures::pin_mut!(timeout);
-            let mut role_assigned = false;
 
             loop {
-                // Set peer ID if not already set
-                if peer_id_ref.borrow().is_none() {
-                    if let Some(socket_peer_id) = socket.id() {
-                        *peer_id_ref.borrow_mut() = Some(socket_peer_id);
-                        position_ref.borrow_mut().peer_id = Some(socket_peer_id.0.to_string());
-                        info!("Client ID set to: {}", socket_peer_id);
+                // Determine our role once on start.
+                if !initialized {
+                    if let Some(super_peer) = socket.super_peer() {
+                        info!("Socket created as super peer: {:?}", super_peer);
+                        self_role = Some(PeerRole::Super);
+                        initialized = true;
+                    } else if let Some(parent) = socket.parent_peer() {
+                        info!("Socket created as child peer (parent: {:?})", parent);
+                        parent_id = Some(parent);
+                        self_role = Some(PeerRole::Child);
+                        initialized = true;
                     }
                 }
 
-                // Handle peer connection and disconnection
+                // Handle new peer connections/disconnections.
                 for (peer, state) in socket.update_peers() {
-                    let mut connected_peers = connected_peers_ref.borrow_mut();
-                    let mut super_peers = known_super_peers_ref.borrow_mut();
-                    let mut child_peers = known_children_peers_ref.borrow_mut();
-                    let mut peer_positions = peer_positions_ref.borrow_mut();
-
                     match state {
                         PeerState::Connected => {
-                            info!("Peer joined: {peer}");
-                            connected_peers.push(peer);
+                            info!("Peer joined: {}", peer);
+                            handshake_states_rc.borrow_mut().insert(
+                                peer,
+                                HandshakeState {
+                                    attempts: 0,
+                                    acknowledged: false,
+                                },
+                            );
+
+                            if let Some(PeerRole::Super) = self_role {
+                                Self::send_handshake(
+                                    &mut socket,
+                                    &handshake_states_rc,
+                                    peer.to_string(),
+                                    "super_handshake",
+                                );
+                            } else if let Some(parent) = parent_id {
+                                if peer == parent {
+                                    info!("Parent peer connection established");
+                                    Self::send_handshake(
+                                        &mut socket,
+                                        &handshake_states_rc,
+                                        peer.to_string(),
+                                        "child_handshake",
+                                    );
+                                }
+                            }
                         }
                         PeerState::Disconnected => {
-                            connected_peers.retain(|&p| p != peer);
-                            child_peers.retain(|&p| p != peer);
-                            super_peers.retain(|&p| p != peer);
-                            peer_positions.remove(&peer);
-                            info!("Peer left: {peer}");
-                        }
-                    }
-                }
-
-                // Assign role (super peer or child peer)
-                if !role_assigned && peer_id_ref.borrow().is_some() {
-                    if let Some(is_super_peer) = socket.super_peer() {
-                        *is_super_ref.borrow_mut() = Some(is_super_peer);
-                        info!("Role assigned: Super peer = {}", is_super_peer);
-                        role_assigned = true;
-
-                        // If super peer, announce to the network
-                        if is_super_peer {
-                            if let Some(my_id) = *peer_id_ref.borrow() {
-                                let announcement = Message::SuperPeer(my_id.0.to_string());
-                                if let Ok(json_data) = serde_json::to_vec(&announcement) {
-                                    let packet = json_data.into_boxed_slice();
-                                    for peer in connected_peers_ref.borrow().iter() {
-                                        socket.channel_mut(0).try_send(packet.clone(), *peer);
-                                    }
-                                }
-                            }
-                        }
-                    } else if let Some(parent) = socket.parent_peer() {
-                        *parent_peer_ref.borrow_mut() = Some(parent);
-                        info!("Role assigned: Child peer with parent = {}", parent);
-                        role_assigned = true;
-
-                        // Register with parent super peer
-                        if let Some(my_id) = *peer_id_ref.borrow() {
-                            let registration = Message::ChildPeer(my_id.0.to_string());
-                            if let Ok(json_data) = serde_json::to_vec(&registration) {
-                                let packet = json_data.into_boxed_slice();
-                                socket.channel_mut(0).try_send(packet, parent);
-                                info!("Message sent to parent");
+                            info!("Peer left: {}", peer);
+                            // Remove from all client maps.
+                            super_peers_rc.borrow_mut().remove(&peer);
+                            child_peers_rc.borrow_mut().remove(&peer);
+                            handshake_states_rc.borrow_mut().remove(&peer);
+                            peer_info_rc.borrow_mut().remove(&peer);
+                            if Some(peer) == parent_id {
+                                initialized = false;
                             }
                         }
                     }
                 }
 
-                // Send position updates based on peer type
-                {
-                    let position = position_ref.borrow();
-                    let is_super = is_super_ref.borrow().unwrap_or(false);
-
-                    let position_data = Position {
-                        peer_id: peer_id_ref.borrow().as_ref().map(|id| id.0.to_string()),
-                        x: position.x,
-                        y: position.y,
-                        x_velocity: position.x_velocity,
-                        y_velocity: position.y_velocity,
-                    };
-
-                    let message = Message::PositionUpdate(position_data);
-
-                    if let Ok(json_data) = serde_json::to_vec(&message) {
-                        let packet = json_data.into_boxed_slice();
-
-                        if is_super {
-                            // Super peer broadcasts to all connected peers
-                            for peer in connected_peers_ref.borrow().iter() {
-                                socket.channel_mut(0).try_send(packet.clone(), *peer);
+                // Send our info based on our role.
+                if let Some(my_peer_id) = socket.id() {
+                    match self_role {
+                        Some(PeerRole::Super) => {
+                            for peer in super_peers_rc.borrow().keys() {
+                                if let Some(state) = handshake_states_rc.borrow().get(peer) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, *peer);
+                                    }
+                                }
                             }
-                        } else if let Some(parent_peer) = *parent_peer_ref.borrow() {
-                            // Child peer sends to its parent super peer
-                            socket.channel_mut(0).try_send(packet.clone(), parent_peer);
+                            for peer in child_peers_rc.borrow().keys() {
+                                if let Some(state) = handshake_states_rc.borrow().get(peer) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, *peer);
+                                    }
+                                }
+                            }
                         }
+                        Some(PeerRole::Child) => {
+                            if let Some(parent) = parent_id {
+                                if let Some(state) = handshake_states_rc.borrow().get(&parent) {
+                                    if state.acknowledged {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, parent);
+                                    }
+                                }
+                            }
+                        }
+                        None => {}
                     }
                 }
 
-                // Process incoming messages
-                for (peer, packet) in socket.channel_mut(0).receive() {
-                    if let Ok(message) = serde_json::from_slice::<Message>(&packet) {
-                        match message {
-                            Message::ChildPeer(child_id) => {
-                                // Super peer handles child peer registration
-                                if is_super_ref.borrow().unwrap_or(false) {
-                                    if let Ok(uuid) = Uuid::parse_str(&child_id) {
-                                        let child_peer_id = PeerId(uuid);
-                                        let mut children_peers =
-                                            known_children_peers_ref.borrow_mut();
-                                        if !children_peers.contains(&child_peer_id) {
-                                            children_peers.push(child_peer_id);
-                                            info!("Added child peer: {}", child_id);
-                                        }
-                                    }
-                                }
-                            }
-                            Message::SuperPeer(super_id) => {
-                                // Super peers share their list of known super peers
-                                if let Ok(uuid) = Uuid::parse_str(&super_id) {
-                                    let super_peer_id = PeerId(uuid);
-                                    let mut super_peers = known_super_peers_ref.borrow_mut();
+                // Process incoming messages.
+                for (peer, packet) in socket.channel_mut(CHANNEL_ID).receive() {
+                    let message = String::from_utf8_lossy(&packet).to_string();
 
-                                    if !super_peers.contains(&super_peer_id) {
-                                        super_peers.push(super_peer_id);
-                                        info!("Added super peer: {}", super_id);
-                                    }
+                    if message.starts_with("info|") {
+                        let parts: Vec<&str> = message.splitn(3, '|').collect();
+                        if parts.len() == 3 {
+                            let sender_id_str = parts[1];
+                            let actual_info = parts[2].to_string();
+                            if let Ok(sender_uuid) = Uuid::parse_str(sender_id_str) {
+                                let sender_id = PeerId(sender_uuid);
+                                peer_info_rc.borrow_mut().insert(sender_id, actual_info);
+                                last_seen_rc.borrow_mut().insert(sender_id, Date::now());
 
-                                    let peer_list: Vec<String> =
-                                        super_peers.iter().map(|p| p.0.to_string()).collect();
-
-                                    let msg = Message::PeerList(peer_list);
-                                    if let Ok(json_data) = serde_json::to_vec(&msg) {
-                                        let packet = json_data.into_boxed_slice();
-                                        socket.channel_mut(0).send(packet, peer);
-                                    }
-                                }
-                            }
-                            Message::PositionUpdate(position_data) => {
-                                // Update peer positions
-                                let mut peer_positions = peer_positions_ref.borrow_mut();
-                                peer_positions.insert(
-                                    peer,
-                                    (
-                                        position_data.x,
-                                        position_data.y,
-                                        position_data.x_velocity,
-                                        position_data.y_velocity,
-                                    ),
-                                );
-
-                                // Super peer forwards position to other peers
-                                if is_super_ref.borrow().unwrap_or(false) {
-                                    let forward_message = Message::PositionUpdate(position_data);
-                                    if let Ok(forward_data) = serde_json::to_vec(&forward_message) {
-                                        let forward_packet = forward_data.into_boxed_slice();
-
-                                        // Send to all child peers
-                                        for child_peer in known_children_peers_ref.borrow().iter() {
+                                if let Some(PeerRole::Super) = self_role {
+                                    for child_peer in child_peers_rc.borrow().keys() {
+                                        if *child_peer != peer {
                                             socket
-                                                .channel_mut(0)
-                                                .send(forward_packet.clone(), *child_peer);
+                                                .channel_mut(CHANNEL_ID)
+                                                .send(packet.clone(), *child_peer);
                                         }
-
-                                        // Send to other super peers (excluding source)
-                                        for other_super_peer in
-                                            known_super_peers_ref.borrow().iter()
-                                        {
-                                            if *other_super_peer != peer {
-                                                socket.channel_mut(0).send(
-                                                    forward_packet.clone(),
-                                                    *other_super_peer,
-                                                );
-                                            }
+                                    }
+                                    for super_peer in super_peers_rc.borrow().keys() {
+                                        if *super_peer != peer {
+                                            socket
+                                                .channel_mut(CHANNEL_ID)
+                                                .send(packet.clone(), *super_peer);
                                         }
                                     }
                                 }
+                            } else {
+                                info!("Error parsing sender ID in info message: invalid UUID");
                             }
-                            Message::PeerList(peers) => {
-                                // Update known super peers list
-                                let mut super_peers = known_super_peers_ref.borrow_mut();
-                                for peer_str in peers {
-                                    if let Ok(uuid) = Uuid::parse_str(&peer_str) {
-                                        let peer_id = PeerId(uuid);
-                                        if !super_peers.contains(&peer_id) {
-                                            super_peers.push(peer_id);
-                                        }
+                        } else {
+                            info!("Received malformed info message: {}", message);
+                        }
+                    } else if message == "super_handshake" {
+                        if let Some(PeerRole::Super) = self_role {
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "OtherSuperPeer".to_string());
+                            info!("Discovered another super peer: {}", peer);
+
+                            let ack_msg = "super_handshake_ack";
+                            info!("Sending super peer acknowledgment to {}: {}", peer, ack_msg);
+                            let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                            socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                        } else {
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "SuperPeerInfo".to_string());
+                            info!("Received super peer handshake from {}", peer);
+
+                            let ack_msg = "super_handshake_ack";
+                            info!("Sending acknowledgment to super peer {}: {}", peer, ack_msg);
+                            let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                            socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                        }
+                    } else if message == "super_handshake_ack" {
+                        if let Some(PeerRole::Super) = self_role {
+                            if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
+                                if let Some(state) = states.get_mut(&peer) {
+                                    state.acknowledged = true;
+                                    info!("Super peer handshake acknowledged by {}", peer);
+                                    if let Some(my_peer_id) = socket.id() {
+                                        let info_msg =
+                                            format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                        let packet =
+                                            info_msg.as_bytes().to_vec().into_boxed_slice();
+                                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                                        info!(
+                                            "Sent info after super peer handshake ack: {}",
+                                            info_msg
+                                        );
                                     }
+                                }
+                            }
+                            super_peers_rc
+                                .borrow_mut()
+                                .insert(peer, "OtherSuperPeer".to_string());
+                            info!("Confirmed another super peer: {}", peer);
+                        }
+                    } else if message == "child_handshake" {
+                        child_peers_rc
+                            .borrow_mut()
+                            .insert(peer, "ChildPeerInfo".to_string());
+                        info!("Received child peer handshake from {}", peer);
+
+                        let ack_msg = "child_handshake_ack";
+                        info!("Sending acknowledgement to child {}: {}", peer, ack_msg);
+                        let packet = ack_msg.as_bytes().to_vec().into_boxed_slice();
+                        socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                    } else if message == "child_handshake_ack" {
+                        if let Some(mut states) = handshake_states_rc.try_borrow_mut().ok() {
+                            if let Some(state) = states.get_mut(&peer) {
+                                state.acknowledged = true;
+                                info!("Child handshake acknowledged by parent {}", peer);
+                                if let Some(my_peer_id) = socket.id() {
+                                    let info_msg =
+                                        format!("info|{}|{}", my_peer_id, info_rc.borrow());
+                                    let packet = info_msg.as_bytes().to_vec().into_boxed_slice();
+                                    socket.channel_mut(CHANNEL_ID).send(packet, peer);
+                                    info!("Sent info after child handshake ack: {}", info_msg);
+                                }
+                            }
+                        }
+                    } else {
+                        if let Some(PeerRole::Super) = self_role {
+                            if child_peers_rc.borrow().contains_key(&peer) {
+                                for child_peer in child_peers_rc.borrow().keys() {
+                                    if *child_peer != peer {
+                                        socket
+                                            .channel_mut(CHANNEL_ID)
+                                            .send(packet.clone(), *child_peer);
+                                    }
+                                }
+                                for super_peer in super_peers_rc.borrow().keys() {
+                                    if *super_peer != peer {
+                                        socket
+                                            .channel_mut(CHANNEL_ID)
+                                            .send(packet.clone(), *super_peer);
+                                    }
+                                }
+                            } else if super_peers_rc.borrow().contains_key(&peer) {
+                                for child_peer in child_peers_rc.borrow().keys() {
+                                    socket
+                                        .channel_mut(CHANNEL_ID)
+                                        .send(packet.clone(), *child_peer);
                                 }
                             }
                         }
                     }
                 }
 
-                // Timeout and loop management
+                // Maintain the loop with a timeout.
                 select! {
                     _ = (&mut timeout).fuse() => {
                         timeout.reset(Duration::from_millis(100));
+                        let peers_to_retry: Vec<String> = handshake_states_rc.borrow()
+                            .iter()
+                            .filter(|(_, state)| state.attempts < MAX_HANDSHAKE_ATTEMPTS && !state.acknowledged)
+                            .map(|(peer_id, _)| peer_id.to_string())
+                            .collect();
+                        for peer in peers_to_retry {
+                            match self_role {
+                                Some(PeerRole::Super) => {
+                                    Self::send_handshake(
+                                        &mut socket,
+                                        &handshake_states_rc,
+                                        peer,
+                                        "super_handshake",
+                                    );
+                                },
+                                Some(PeerRole::Child) => {
+                                    if let Some(parent) = parent_id {
+                                        if peer == parent.to_string() {
+                                            Self::send_handshake(
+                                                &mut socket,
+                                                &handshake_states_rc,
+                                                peer,
+                                                "child_handshake",
+                                            );
+                                        }
+                                    }
+                                },
+                                None => {}
+                            }
+                        }
+                        let now = Date::now();
+                        let mut to_remove = vec![];
+
+                        for (peer_id, last_seen_time) in last_seen_rc.borrow().iter() {
+                            if now - *last_seen_time > 5000.0 {
+                                to_remove.push(*peer_id);
+                            }
+                        }
+
+                        for peer_id in to_remove {
+                            super_peers_rc.borrow_mut().remove(&peer_id);
+                            child_peers_rc.borrow_mut().remove(&peer_id);
+                            peer_info_rc.borrow_mut().remove(&peer_id);
+                            handshake_states_rc.borrow_mut().remove(&peer_id);
+                            last_seen_rc.borrow_mut().remove(&peer_id);
+                        }
                     }
                     _ = &mut loop_fut => {
-                        info!("Loop future finished.");
                         break;
                     }
                 }

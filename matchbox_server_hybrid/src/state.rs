@@ -1,7 +1,7 @@
 use axum::extract::ws::Message;
-use matchbox_protocol::{PeerId, JsonPeerEvent};
+use matchbox_protocol::{JsonPeerEvent, PeerId};
 use matchbox_signaling::{
-    common_logic::{StateObj, SignalingChannel, try_send},
+    common_logic::{try_send, SignalingChannel, StateObj},
     SignalingError, SignalingState,
 };
 use std::collections::{HashMap, HashSet};
@@ -11,13 +11,9 @@ use tracing::{error, info};
 #[derive(Debug)]
 pub enum PeerRole {
     /// Child peer: stores the ID of its parent super peer, if any.
-    Child {
-        parent_id: Option<PeerId>,
-    },
+    Child { parent_id: Option<PeerId> },
     /// Super peer: stores a set of child peers.
-    Super {
-        children: HashSet<PeerId>,
-    },
+    Super { children: HashSet<PeerId> },
 }
 
 /// A single Peer type that can be either a child or super peer.
@@ -51,7 +47,7 @@ impl Peer {
             signaling_channel,
         }
     }
-    
+
     /// Returns true if this peer is a super peer.
     pub fn is_super(&self) -> bool {
         matches!(self.role, PeerRole::Super { .. })
@@ -63,10 +59,9 @@ impl Peer {
 pub struct HybridState {
     pub peers: StateObj<HashMap<PeerId, Peer>>,
 }
-impl SignalingState for HybridState {}  
+impl SignalingState for HybridState {}
 
 impl HybridState {
-
     /// Check if a given `PeerId` corresponds to a super peer
     pub fn is_super_peer(&self, peer_id: &PeerId) -> bool {
         let peers = self.peers.lock().unwrap();
@@ -74,6 +69,29 @@ impl HybridState {
             matches!(peer.role, PeerRole::Super { .. })
         } else {
             false
+        }
+    }
+
+    pub fn promote_child_to_super(&mut self, peer_id: PeerId) {
+        let mut peers = self.peers.lock().unwrap();
+
+        if let Some(peer) = peers.get_mut(&peer_id) {
+            // Notify the peer of their promotion
+            let event = Message::Text(JsonPeerEvent::SuperIdAssigned(peer_id).to_string());
+            if let Err(e) = try_send(&peer.signaling_channel, event.clone()) {
+                error!("failed to notify promoted super peer {peer_id}: {e:?}");
+            } else {
+                info!("notified {peer_id} of promotion to super peer");
+            }
+
+            // Notify other super peers
+            for (other_id, other_peer) in peers.iter() {
+                if *other_id != peer_id && other_peer.is_super() {
+                    let _ = self.try_send_to_peer(*other_id, event.clone());
+                }
+            }
+        } else {
+            error!("Cannot promote {peer_id} because they do not exist");
         }
     }
 
@@ -115,42 +133,64 @@ impl HybridState {
         peers
             .values()
             .filter(|peer| matches!(peer.role, PeerRole::Super { .. }))
-            .min_by_key(|peer| {
-                match &peer.role {
-                    PeerRole::Super { children } => (children.len(), peer.id),
-                    _ => (usize::MAX, peer.id), 
-                }
+            .min_by_key(|peer| match &peer.role {
+                PeerRole::Super { children } => (children.len(), peer.id),
+                _ => (usize::MAX, peer.id),
             })
             .map(|peer| peer.id)
     }
 
     /// Add a new super peer
     pub fn add_super_peer(&mut self, peer: PeerId, sender: SignalingChannel) {
-        let event = Message::Text(JsonPeerEvent::NewPeer(peer).to_string());
-        let super_peers = { self.get_super_peer_ids()};
+        let event = Message::Text(JsonPeerEvent::SuperIdAssigned(peer).to_string());
+        let super_peers = { self.get_super_peer_ids() };
+
+        // Notify the new super peer itself
+        if let Err(e) = try_send(&sender, event.clone()) {
+            error!("failed to inform new super peer {peer} of their status: {e:?}");
+        } else {
+            info!("informed new super peer {peer} -> SuperIdAssigned");
+        }
 
         super_peers.iter().for_each(|peer_id| {
             if let Err(e) = self.try_send_to_peer(*peer_id, event.clone()) {
                 error!("error informing {peer_id} of new super peer {peer}: {e:?}");
             }
         });
-        
-        self.peers.lock().as_mut().unwrap().insert(peer, Peer::new_super(peer, sender));
+
+        self.peers
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(peer, Peer::new_super(peer, sender));
+    }
+
+    pub fn connect_child_parent(&mut self, peer: PeerId, parent: PeerId, sender: SignalingChannel) {
+        let event_text = JsonPeerEvent::ParentAssigned(parent).to_string();
+        let event = Message::Text(event_text.clone());
+        if let Err(e) = try_send(&sender, event) {
+            error!("error sending to {peer}: {e:?}");
+        }
     }
 
     /// Add child peer
     pub fn add_child_peer(&mut self, peer: PeerId, sender: SignalingChannel) {
-        self.peers.lock()
-                        .as_mut()
-                        .unwrap()
-                        .insert(peer, Peer::new_child(peer, sender));
+        self.peers
+            .lock()
+            .as_mut()
+            .unwrap()
+            .insert(peer, Peer::new_child(peer, sender));
     }
 
     /// Connect child to super peer
-    pub fn connect_child(&mut self, child_id: PeerId, super_id: PeerId) -> Result<(), SignalingError> {
+    pub fn connect_child(
+        &mut self,
+        child_id: PeerId,
+        super_id: PeerId,
+    ) -> Result<(), SignalingError> {
         {
             let mut peers = self.peers.lock().unwrap();
-            
+
             {
                 // Find the super peer in the map.
                 let super_peer = peers
@@ -189,8 +229,8 @@ impl HybridState {
 
         let event = Message::Text(JsonPeerEvent::NewPeer(child_id).to_string());
         self.try_send_to_peer(super_id, event)
-    }   
-    
+    }
+
     /// Disconnect child peer from super peer
     pub fn remove_child_peer(&mut self, child_id: PeerId) {
         // Store the parent ID outside the lock, so we can notify them after dropping the lock.
@@ -203,7 +243,9 @@ impl HybridState {
             if let Some(child_peer) = peers.remove(&child_id) {
                 // Check if this peer was actually a Child
                 match child_peer.role {
-                    PeerRole::Child { parent_id: Some(pid) } => {
+                    PeerRole::Child {
+                        parent_id: Some(pid),
+                    } => {
                         // Remove this child from the parent's 'children' set
                         if let Some(parent_peer) = peers.get_mut(&pid) {
                             if let PeerRole::Super { children } = &mut parent_peer.role {
@@ -286,7 +328,8 @@ impl HybridState {
             // Turn `recruit_id` into a super peer in place, then re‐attach the other children to it.
             // We do so in a new scope, so the lock is short‐lived.
             {
-                let mut peers_map = self.peers.lock().unwrap();
+                let mut peers_map: std::sync::MutexGuard<'_, HashMap<PeerId, Peer>> =
+                    self.peers.lock().unwrap();
 
                 // If the recruit still exists in the map, update it.
                 if let Some(recruit) = peers_map.get_mut(&recruit_id) {
@@ -298,7 +341,7 @@ impl HybridState {
                         // If it’s already a super, or something else, we might handle differently
                         _ => {}
                     }
-                    // Now make it a super with an empty children set, 
+                    // Now make it a super with an empty children set,
                     // or you might directly insert the “former_children minus itself.”
                     recruit.role = PeerRole::Super {
                         children: HashSet::new(),
@@ -309,12 +352,15 @@ impl HybridState {
             } // lock dropped
 
             info!("Promoted peer {recruit_id} to super peer");
+            self.promote_child_to_super(recruit_id);
 
             // Re‐attach the other children to the new super peer
             for &child_id in &former_children {
                 if child_id != recruit_id {
                     if let Err(e) = self.connect_child(child_id, recruit_id) {
-                        error!("Failed to connect child {child_id} to new super {recruit_id}: {e:?}");
+                        error!(
+                            "Failed to connect child {child_id} to new super {recruit_id}: {e:?}"
+                        );
                     }
                 }
             }
@@ -322,10 +368,8 @@ impl HybridState {
     }
 
     /// Transfers child with min id from giver to receiever super peers
-    pub fn move_child(&mut self, giver_id: PeerId, receiver_id: PeerId){
-
+    pub fn move_child(&mut self, giver_id: PeerId, receiver_id: PeerId) {
         let child_id = {
-
             if let Some(giver) = self.peers.lock().unwrap().get_mut(&giver_id) {
                 match &mut giver.role {
                     PeerRole::Super { children } => {
@@ -333,22 +377,22 @@ impl HybridState {
                         if cid.is_some() {
                             children.remove(&cid.unwrap());
                             cid.unwrap()
-                        }
-                        else {
+                        } else {
                             error!("peer {giver_id} has no children to give");
-                            return
+                            return;
                         }
                     }
-            
+
                     _ => {
-                            error!("trying to move child from {giver_id} but they are not a super peer");
-                            return
+                        error!(
+                            "trying to move child from {giver_id} but they are not a super peer"
+                        );
+                        return;
                     }
                 }
-            }
-            else {
+            } else {
                 error!("{giver_id} does not exist in the network");
-                return
+                return;
             }
         };
 
@@ -357,21 +401,20 @@ impl HybridState {
             Ok(()) => info!("Notified parent {giver_id} of child peer {child_id} removal"),
             Err(e) => error!("Failed to notify parent {giver_id} of child removal: {e:?}"),
         }
-    
+
         let event = Message::Text(JsonPeerEvent::PeerLeft(giver_id).to_string());
         match self.try_send_to_peer(child_id, event) {
             Ok(()) => info!("Notified child {child_id} of parent {giver_id} disconnection"),
             Err(e) => error!("Failed to notify child {child_id} of parent disconnection: {e:?}"),
         }
-    
+
         match self.connect_child(child_id, receiver_id) {
             Ok(()) => info!("Connected child {child_id} to parent {giver_id}"),
             Err(e) => error!("Failed to notify parent {giver_id} of child connection: {e:?}"),
-        }   
+        }
     }
 
     pub fn load_balance(&mut self) {
-
         // Get list of super peers and their child counts
         let mut super_info: Vec<(PeerId, usize)> = {
             let peers = self.peers.lock().unwrap();
@@ -394,7 +437,7 @@ impl HybridState {
 
         // Sort super peers by number of children
         super_info.sort_by_key(|&(_id, child_count)| child_count);
-        
+
         // Calculate the average number of children per super peer
         let total_children: usize = super_info.iter().map(|(_, c)| c).sum();
         let num_supers = super_info.len();
@@ -407,10 +450,9 @@ impl HybridState {
 
         for n in 0..super_info.len() {
             if n < remainder {
-                target_info.push((super_info[n].0, super_info[n].1, average + 1)); 
-            }
-            else {
-                target_info.push((super_info[n].0, super_info[n].1, average)); 
+                target_info.push((super_info[n].0, super_info[n].1, average + 1));
+            } else {
+                target_info.push((super_info[n].0, super_info[n].1, average));
             }
         }
 
@@ -420,14 +462,13 @@ impl HybridState {
         for n in 0..target_info.len() {
             if target_info[n].1 > target_info[n].2 {
                 overloaded_idx.push(n);
-            }
-            else if target_info[n].1 < target_info[n].2{
+            } else if target_info[n].1 < target_info[n].2 {
                 underloaded_idx.push(n);
             }
         }
 
-        let mut i:usize= 0;
-        let mut j:usize = 0;
+        let mut i: usize = 0;
+        let mut j: usize = 0;
         while i < overloaded_idx.len() && j < underloaded_idx.len() {
             if target_info[overloaded_idx[i]].1 <= target_info[overloaded_idx[i]].2 {
                 i += 1;
@@ -440,12 +481,14 @@ impl HybridState {
 
             target_info[overloaded_idx[i]].1 -= 1;
             target_info[underloaded_idx[j]].1 += 1;
-            self.move_child(target_info[overloaded_idx[i]].0, target_info[underloaded_idx[j]].0);
+            self.move_child(
+                target_info[overloaded_idx[i]].0,
+                target_info[underloaded_idx[j]].0,
+            );
             num_moves += 1;
         }
 
         info!("{num_moves} reassignments made in load balancing");
-
     }
     // TODO: Logic for super peer assignment according to bandwidth
     //-------------------------------------------------------------------
@@ -463,6 +506,6 @@ impl HybridState {
             .unwrap()
             .get(&peer)
             .ok_or_else(|| SignalingError::UnknownPeer)
-            .and_then(|sender| try_send(&sender.signaling_channel, message))      
+            .and_then(|sender| try_send(&sender.signaling_channel, message))
     }
 }
