@@ -5140,6 +5140,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "speedtest"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "futures",
+ "futures-timer",
+ "log",
+ "matchbox_socket",
+ "tokio",
+ "tracing-subscriber",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
