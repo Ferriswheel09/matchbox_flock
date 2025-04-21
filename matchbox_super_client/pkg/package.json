@@ -1,0 +1,15 @@
+{
+  "name": "matchbox_super_client",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "matchbox_super_client_bg.wasm",
+    "matchbox_super_client.js",
+    "matchbox_super_client.d.ts"
+  ],
+  "main": "matchbox_super_client.js",
+  "types": "matchbox_super_client.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

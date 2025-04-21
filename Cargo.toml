@@ -1,12 +1,9 @@
 [workspace]
 members = [
-  "bevy_matchbox",
   "matchbox_protocol",
   "matchbox_socket",
-  "matchbox_server",
   "matchbox_signaling",
-  "examples/*", 
   "matchbox_super_client", 
   "matchbox_server_hybrid", 
 ]
-resolver = "2" # Important! Bevy/WGPU needs this!
+resolver = "2" 
