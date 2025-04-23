@@ -1,5 +1,6 @@
 use futures::{select, FutureExt};
 use futures_timer::Delay;
+use js_sys::Date;
 use log::info;
 use matchbox_socket::{PeerId, PeerState, WebRtcSocket, WebRtcSocketBuilder};
 use serde::{Deserialize, Serialize};
@@ -7,14 +8,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
-use js_sys::Date;
+use url::Url;
 use uuid::Uuid;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::js_sys;
 
 const CHANNEL_ID: usize = 0;
-const HANDSHAKE_RETRY_INTERVAL_MS: u64 = 1000; // Retry every 1 second
 const MAX_HANDSHAKE_ATTEMPTS: u8 = 5; // Maximum retry attempts
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +33,7 @@ struct HandshakeState {
 pub struct Client {
     // All fields are now wrapped in Rc<RefCell<...>>.
     info: Rc<RefCell<String>>,
+    url: Rc<RefCell<String>>,
     peer_info: Rc<RefCell<HashMap<PeerId, String>>>,
     super_peers: Rc<RefCell<HashMap<PeerId, String>>>, // Map peer id to any additional info
     child_peers: Rc<RefCell<HashMap<PeerId, String>>>,
@@ -46,12 +47,18 @@ impl Client {
     pub fn new() -> Self {
         Self {
             info: Rc::new(RefCell::new(String::new())),
+            url: Rc::new(RefCell::new(String::new())),
             peer_info: Rc::new(RefCell::new(HashMap::new())),
             super_peers: Rc::new(RefCell::new(HashMap::new())),
             child_peers: Rc::new(RefCell::new(HashMap::new())),
             peer_handshake_states: Rc::new(RefCell::new(HashMap::new())),
             last_seen: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    #[wasm_bindgen]
+    pub fn set_url(&mut self, url: String) {
+        *self.url.borrow_mut() = url;
     }
 
     #[wasm_bindgen]
@@ -157,31 +164,50 @@ impl Client {
         let child_peers_rc = self.child_peers.clone();
         let handshake_states_rc = self.peer_handshake_states.clone();
         let last_seen_rc = self.last_seen.clone();
+        let url_rc = self.url.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            let turn_server = matchbox_socket::RtcIceServerConfig {
-                urls: vec![
-                    "stun:34.229.159.62:3478".to_string(),
-                    "turn:34.229.159.62:3478".to_string(),
-                ],
-                username: Some("youruser".to_string()),
-                credential: Some("yourpassword".to_string()),
-            };
+            let signaling_url = url_rc.borrow().clone();
 
-            let (mut socket, loop_fut) = WebRtcSocketBuilder::new("ws://34.229.159.62:3536/")
-                .ice_server(turn_server)
+            let parsed_url = Url::parse(&signaling_url)
+                .map_err(|e| JsValue::from_str(&format!("Invalid URL: {}", e)))
+                .unwrap(); // you can handle this better if needed
+
+            let host = parsed_url
+                .host_str()
+                .expect("No host in signaling URL")
+                .to_string();
+
+            // Optional ICE server setup
+            let mut builder = WebRtcSocketBuilder::new(&signaling_url)
                 .add_reliable_channel()
-                .reconnect_attempts(Some(5))
-                .build();
+                .reconnect_attempts(Some(5));
 
-            let mut loop_fut = loop_fut.fuse();
+            if host != "localhost" && host != "127.0.0.1" {
+                let turn_port = 3478;
+                let ice_host = format!("{}:{}", host, turn_port);
+
+                let turn_server = matchbox_socket::RtcIceServerConfig {
+                    urls: vec![format!("stun:{}", ice_host), format!("turn:{}", ice_host)],
+                    username: Some("youruser".to_string()),
+                    credential: Some("yourpassword".to_string()),
+                };
+
+                builder = builder.ice_server(turn_server);
+            } else {
+                info!("Running locally; no TURN/STUN server needed");
+            }
+
+            let (mut socket, loop_fut) = builder.build();
+
+            let loop_fut = loop_fut.fuse();
             futures::pin_mut!(loop_fut);
 
             let mut initialized = false;
             let mut parent_id: Option<PeerId> = None;
             let mut self_role: Option<PeerRole> = None;
 
-            let mut timeout = Delay::new(Duration::from_millis(100));
+            let timeout = Delay::new(Duration::from_millis(100));
             futures::pin_mut!(timeout);
 
             loop {
